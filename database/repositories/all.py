@@ -2,14 +2,25 @@
 
 All persistence honors the documented UNIQUE/CHECK constraints; duplicate-safe
 inserts (upserts) are used where the data model allows deduplication.
+
+Each per-table repository owns its SQL and speaks rows. The ``Repositories``
+facade at the bottom of this module additionally implements the flat
+``core.orchestrator.Storage`` contract, so the production chain is exactly
+``Orchestrator -> Storage contract -> Repositories -> PostgreSQL`` with no
+second storage abstraction. The contract methods are the single place the two
+views meet: they delegate to the table repository that owns the SQL and map
+rows back to the committed dataclass entities the contract is written in.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from decimal import Decimal
+from typing import Any, Iterable, Mapping, Optional
+from uuid import UUID
 
 import psycopg
 
+from core.orchestrator import Storage
 from database.models.entities import (
     Asset,
     AssetIp,
@@ -27,6 +38,88 @@ from database.models.entities import (
     WebApp,
 )
 from database.repositories.base import BaseRepository
+
+
+# -- row -> entity mapping ---------------------------------------------------
+#
+# The Storage contract is expressed in the committed dataclasses, while the
+# repositories speak dict rows. These mappers are the only translation point.
+# ``numeric`` columns come back from psycopg as ``Decimal``; the entities
+# declare ``float``, so they are narrowed here to keep the Postgres-backed
+# storage observationally equal to the in-memory test double.
+
+def _as_float(value: Any) -> Any:
+    return float(value) if isinstance(value, Decimal) else value
+
+
+def _run_from_row(row: Optional[Mapping[str, Any]]) -> Optional[Run]:
+    if row is None:
+        return None
+    return Run(
+        id=row["id"],
+        program_id=row["program_id"],
+        status=row["status"],
+        target=row["target"],
+        configuration_snapshot=row["configuration_snapshot"] or {},
+        started_at=row["started_at"],
+        completed_at=row["completed_at"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _task_from_row(row: Optional[Mapping[str, Any]]) -> Optional[Task]:
+    if row is None:
+        return None
+    return Task(
+        id=row["id"],
+        run_id=row["run_id"],
+        type=row["type"],
+        target=row["target"],
+        parent_task_id=row["parent_task_id"],
+        priority=_as_float(row["priority"]),
+        status=row["status"],
+        fingerprint=row["fingerprint"],
+        reason=row["reason"],
+        created_at=row["created_at"],
+        started_at=row["started_at"],
+        completed_at=row["completed_at"],
+    )
+
+
+def _tool_run_from_row(row: Optional[Mapping[str, Any]]) -> Optional[ToolRun]:
+    if row is None:
+        return None
+    return ToolRun(
+        id=row["id"],
+        task_id=row["task_id"],
+        tool_name=row["tool_name"],
+        command=list(row["command"] or []),
+        exit_code=row["exit_code"],
+        raw_output_ref=row["raw_output_ref"],
+        started_at=row["started_at"],
+        completed_at=row["completed_at"],
+    )
+
+
+def _hypothesis_from_row(row: Optional[Mapping[str, Any]]) -> Optional[Hypothesis]:
+    if row is None:
+        return None
+    return Hypothesis(
+        id=row["id"],
+        run_id=row["run_id"],
+        endpoint_id=row["endpoint_id"],
+        statement=row["statement"],
+        truth_label=row["truth_label"],
+        confidence=_as_float(row["confidence"]),
+        severity=row["severity"],
+        priority=row["priority"],
+        status=row["status"],
+        target=row["target"],
+        validation_step=row["validation_step"],
+        review_status=row["review_status"],
+        review_reason=row["review_reason"],
+    )
 
 
 class OrganizationRepository(BaseRepository):
@@ -65,6 +158,9 @@ class RunRepository(BaseRepository):
         return self._insert(
             "runs",
             {
+                # The entity id is authoritative: the Orchestrator holds the Run
+                # object and later addresses it by this id, so the row must keep
+                # it rather than let the database mint a different one.
                 "id": run.id,
                 "program_id": run.program_id,
                 "status": run.status,
@@ -253,6 +349,7 @@ class TaskRepository(BaseRepository):
         return self._insert(
             "tasks",
             {
+                "id": task.id,
                 "run_id": task.run_id,
                 "type": task.type,
                 "target": task.target,
@@ -300,6 +397,7 @@ class ToolRunRepository(BaseRepository):
         return self._insert(
             "tool_runs",
             {
+                "id": run.id,
                 "task_id": run.task_id,
                 "tool_name": run.tool_name,
                 "command": run.command,
@@ -390,8 +488,16 @@ class HypothesisRepository(BaseRepository):
         return cur.fetchone()
 
 
-class Repositories:
-    """Aggregate facade over all repositories sharing one connection."""
+class Repositories(Storage):
+    """Aggregate facade over all repositories sharing one connection.
+
+    Doubles as the production implementation of the flat ``Storage`` contract
+    (``core.orchestrator.Storage``): the orchestrator is written against that
+    contract only, so making this class conform is what turns
+    ``Orchestrator -> Storage -> PostgreSQL`` into a real chain instead of an
+    aspiration. Every contract method delegates to the per-table repository
+    that already owns the SQL; nothing here duplicates a query.
+    """
 
     def __init__(self, conn: psycopg.Connection):
         self.conn = conn
@@ -409,3 +515,67 @@ class Repositories:
         self.tool_runs = ToolRunRepository(conn)
         self.evidence = EvidenceRepository(conn)
         self.hypotheses = HypothesisRepository(conn)
+
+    # -- core.orchestrator.Storage contract ----------------------------------
+    #
+    # Returns the committed dataclass entities, never rows, so the orchestrator
+    # cannot tell this apart from any other conforming Storage implementation.
+
+    def create_run(self, run: Run) -> Run:
+        return _run_from_row(self.runs.insert(run))
+
+    def get_run(self, run_id: UUID) -> Optional[Run]:
+        return _run_from_row(self.runs.get(run_id))
+
+    def list_runs(self) -> list[Run]:
+        return [_run_from_row(row) for row in self.runs.list_runs()]
+
+    def set_run_status(self, run_id: UUID, status: str) -> None:
+        self.runs.update_status(run_id, status)
+
+    def insert_tasks(self, tasks: Iterable[Task]) -> None:
+        for task in tasks:
+            self.tasks.insert(task)
+
+    def list_tasks(self, run_id: UUID) -> list[Task]:
+        return [_task_from_row(row) for row in self.tasks.list_for_run(run_id)]
+
+    def list_tasks_by_status(self, run_id: UUID, status: str) -> list[Task]:
+        return [_task_from_row(row) for row in self.tasks.list_by_status(run_id, status)]
+
+    def set_task_status(self, task_id: UUID, status: str) -> None:
+        self.tasks.update_status(task_id, status)
+
+    def insert_tool_run(self, tr: ToolRun) -> ToolRun:
+        return _tool_run_from_row(self.tool_runs.insert(tr))
+
+    def finalize_tool_run(
+        self, tool_run_id: UUID, exit_code: int, raw_output_ref: Optional[str]
+    ) -> None:
+        self.tool_runs.finalize(tool_run_id, exit_code, raw_output_ref)
+
+    def insert_hypothesis(self, hypothesis: Hypothesis) -> Hypothesis:
+        return _hypothesis_from_row(self.hypotheses.insert(hypothesis))
+
+    def get_hypothesis(
+        self, run_id: UUID, hypothesis_id: UUID
+    ) -> Optional[Hypothesis]:
+        return _hypothesis_from_row(self.hypotheses.get(run_id, hypothesis_id))
+
+    def list_hypotheses(self, run_id: UUID) -> list[Hypothesis]:
+        return [_hypothesis_from_row(row) for row in self.hypotheses.list_for_run(run_id)]
+
+    def set_hypothesis_review(
+        self,
+        run_id: UUID,
+        hypothesis_id: UUID,
+        review_status: str,
+        review_reason: Optional[str],
+        truth_label: str,
+        status: str,
+    ) -> Optional[Hypothesis]:
+        return _hypothesis_from_row(
+            self.hypotheses.set_review(
+                run_id, hypothesis_id, review_status, review_reason, truth_label, status
+            )
+        )

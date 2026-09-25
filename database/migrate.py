@@ -36,11 +36,47 @@ def version_of(path: Path) -> int:
     return int(path.name.split("_", 1)[0])
 
 
+def _row_value(row, key: str, index: int = 0):
+    """Read one column from a result row under either psycopg row factory.
+
+    ``apply``/``revert`` are called both with a plain tuple-row connection (the
+    test fixtures) and with the dict-row connection ``DatabaseConnection`` hands
+    to ``Repositories``, so bookkeeping must not assume one of them.
+    """
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return row.get(key)
+    return row[index]
+
+
+def _schema_migrations_exists(conn: psycopg.Connection) -> bool:
+    # Unqualified, exactly like every other bookkeeping query here, so the guard
+    # follows the connection's search_path instead of assuming ``public``.
+    row = conn.execute("SELECT to_regclass('schema_migrations')").fetchone()
+    return bool(_row_value(row, "to_regclass"))
+
+
 def _applied_versions(conn: psycopg.Connection) -> set[int]:
     cur = conn.execute(
         "SELECT version FROM schema_migrations ORDER BY version"
     )
-    return {row[0] for row in cur.fetchall()}
+    return {_row_value(row, "version") for row in cur.fetchall()}
+
+
+def _flush(conn: psycopg.Connection) -> None:
+    """Commit any implicit transaction opened by a bookkeeping statement.
+
+    This is load-bearing, not tidiness. On a non-autocommit connection every
+    statement implicitly opens a transaction, and psycopg3 silently downgrades
+    ``conn.transaction()`` to a SAVEPOINT when one is already open. Exiting that
+    block then only RELEASEs the savepoint: the migration DDL is never committed,
+    its locks stay held, and a connection that closes afterwards (the CLI's
+    ``with connect(...)``) rolls the whole migration back. Committing first
+    guarantees the following ``conn.transaction()`` is a real transaction.
+    """
+    if not conn.autocommit:
+        conn.commit()
 
 
 def apply(conn: psycopg.Connection, directory: Path = MIGRATIONS_DIR) -> list[int]:
@@ -54,6 +90,7 @@ def apply(conn: psycopg.Connection, directory: Path = MIGRATIONS_DIR) -> list[in
         )
     except psycopg.Error as exc:
         raise MigrationError(f"cannot create schema_migrations: {exc}") from exc
+    _flush(conn)
 
     applied = _applied_versions(conn)
     versions = []
@@ -62,6 +99,7 @@ def apply(conn: psycopg.Connection, directory: Path = MIGRATIONS_DIR) -> list[in
         if version in applied:
             continue
         try:
+            _flush(conn)
             with conn.transaction():
                 conn.execute(path.read_text(encoding="utf-8"))
                 conn.execute(
@@ -82,7 +120,15 @@ def revert(
     """Revert applied migrations back to ``target_version`` (default: none).
 
     Returns the list of versions reverted, in reverse version order.
+
+    ``schema_migrations`` is kept consistent with the schema it describes: a
+    reverted version's bookkeeping row is removed in the same transaction as
+    its down file, so a later ``apply`` re-runs that migration instead of
+    reporting a version whose columns no longer exist. A database that has never
+    been migrated has nothing to revert and yields ``[]``.
     """
+    if not _schema_migrations_exists(conn):
+        return []
     applied = sorted(_applied_versions(conn))
     to_revert = [v for v in applied if v > target_version]
     reverted: list[int] = []
@@ -97,7 +143,14 @@ def revert(
             )
         down = candidates[0]
         try:
+            _flush(conn)
             with conn.transaction():
+                # Delete the bookkeeping row *before* running the down file:
+                # 0001's down migration drops schema_migrations itself, and a
+                # reverted version must never be left recorded as applied.
+                conn.execute(
+                    "DELETE FROM schema_migrations WHERE version = %s", (version,)
+                )
                 conn.execute(down.read_text(encoding="utf-8"))
         except psycopg.Error as exc:
             raise MigrationError(f"revert {down.name} failed: {exc}") from exc

@@ -1,13 +1,24 @@
 """Serve seam for ARGUS (Phase 13).
 
-Wires the committed ``Orchestrator`` + committed ``MemoryStorage`` + committed
-``DnsResolverAdapter`` into the committed ``create_app`` factory so the API can
-be served with a real in-process storage and a real (in-process) DNS tool.
+Wires the committed ``Orchestrator`` + the committed PostgreSQL-backed
+``Repositories`` implementation of the ``Storage`` contract + the committed
+``DnsResolverAdapter`` into the committed ``create_app`` factory, so the API can
+be served against the authoritative store from ``05_DATA_MODEL.md``.
 
 API key precedence:
   1. ``ARGUS_API_KEY`` environment variable
   2. the ``api_key`` argument (used by ``create_serve_app``)
   3. the committed default ``_API_KEY = "phase-10"`` from ``api.server``
+
+Storage precedence:
+  1. an explicitly injected ``storage`` (tests / embedding)
+  2. PostgreSQL via ``ARGUS_DATABASE_URL`` (or ``database_url=``) -- production
+  3. ``in_memory=True`` -- an explicit, opt-in development mode only
+
+There is deliberately **no** silent fallback to ``MemoryStorage``: if
+``ARGUS_DATABASE_URL`` is unset, production startup fails loudly instead of
+serving an unauditable, non-durable store. ``MemoryStorage`` remains a test
+double implementing the same ``Storage`` contract.
 
 The factory is uvicorn-``--factory`` compatible (zero-argument callable
 returning a ``FastAPI`` instance); it constructs the whole injection graph so
@@ -28,6 +39,15 @@ from core.scope_guard import ScopeGuard, ScopeRule, ScopeRuleType
 from core.tool_runner import ToolRunner, ToolRunnerError
 from database.models.entities import ToolRun
 from recon.dns.resolver import DnsResolverAdapter, make_resolver
+
+#: Environment variable holding the PostgreSQL URL for the served runtime. Same
+#: variable name ``core.config.DatabaseConfig`` already reads.
+DATABASE_URL_ENV = "ARGUS_DATABASE_URL"
+
+
+class ServeConfigurationError(RuntimeError):
+    """Raised when the serve seam cannot build a production storage backend."""
+
 
 #: Inject the DNS resolution outcome into an ``Orchestrator.run_tool`` seam.
 def _dns_run_tool(
@@ -58,30 +78,62 @@ def _dns_run_tool(
     )
 
 
+def _postgres_storage(database_url: Optional[str]):
+    """Build the production ``Storage``: a migrated PostgreSQL repository facade.
+
+    Migrations are applied here because the committed CLI is still a no-op, so
+    this is the only entry point that can bring a fresh database up to the
+    committed schema. ``ensure_migrated`` is idempotent.
+    """
+    if not database_url:
+        raise ServeConfigurationError(
+            f"production serve requires PostgreSQL: set {DATABASE_URL_ENV} (or pass "
+            f"database_url=). In-memory storage is available only via the explicit "
+            f"in_memory=True development flag; it is never selected implicitly."
+        )
+
+    from database.migrate import ensure_migrated
+    from database.repositories.all import Repositories
+    from database.repositories.base import DatabaseConnection
+
+    connection = DatabaseConnection(database_url)
+    raw = connection.connect()
+    try:
+        ensure_migrated(raw)
+    except Exception:
+        connection.close()
+        raise
+    return Repositories(raw)
+
+
 def create_serve_app(
     *,
     api_key: Optional[str] = None,
     storage=None,
     resolver_fn=None,
+    database_url: Optional[str] = None,
+    in_memory: bool = False,
 ) -> "object":
     """Build the fully-wired FastAPI app for serving ARGUS.
 
     ``api_key`` is used when ``ARGUS_API_KEY`` is unset, otherwise the committed
-    server default is used. ``storage``/``resolver_fn`` are optional injection points
-    for tests; defaults use committed ``MemoryStorage`` and the committed in-process DNS
-    adapter.
+    server default is used. ``storage``/``resolver_fn`` are optional injection
+    points for tests. With neither ``storage`` nor ``in_memory``, the app is
+    backed by PostgreSQL (``database_url`` or ``ARGUS_DATABASE_URL``) and refuses
+    to start if no database is configured.
     """
-    from core.memory_storage import MemoryStorage as _MS
-    from core.orchestrator import Orchestrator as _Orch
-    from api.server import create_app as _create
-
     effective_key = os.environ.get("ARGUS_API_KEY") or api_key or _API_KEY
-    mem = storage if storage is not None else _MS()
-    orch = _Orch(
-        storage=mem,
+    if storage is not None:
+        store = storage
+    elif in_memory:
+        store = MemoryStorage()
+    else:
+        store = _postgres_storage(database_url or os.environ.get(DATABASE_URL_ENV))
+    orch = Orchestrator(
+        storage=store,
         run_tool=lambda task: _dns_run_tool(task, resolver_fn=resolver_fn),
     )
-    return _create(orch, api_key=effective_key)
+    return create_app(orch, api_key=effective_key)
 
 
 def serve_factory() -> "object":

@@ -1,8 +1,7 @@
 """Phase-13 serve-seam gates (``api/serve.py``).
 
-Byte-pins the committed serve seam exactly as committed (read-channel pinned
-this session): the seam threads committed ``ToolRunner()``, committed
-deny-all/deny-by-default ``ScopeGuard.from_config(committed ScopeConfig())``,
+Byte-pins the committed serve seam: the seam threads committed ``ToolRunner()``,
+committed deny-all/deny-by-default ``ScopeGuard.from_config(committed ScopeConfig())``,
 and the committed in-process ``DnsResolverAdapter`` into the committed
 ``create_app`` FastAPI factory; ``_dns_run_tool``/``create_serve_app``/
 ``serve_factory`` construction order and API-key precedence
@@ -10,10 +9,17 @@ and the committed in-process ``DnsResolverAdapter`` into the committed
 No live DNS, no subprocess, no fabricated green: fixtures resolve in-process
 through the committed adapter's committed deny-default, and tests assert the
 **actual committed** fail-closed posture.
+
+Storage posture (Stage 1): production ``create_serve_app`` is backed by
+PostgreSQL and raises ``ServeConfigurationError`` when no database is
+configured. These gates drive the app through the explicit ``in_memory=True``
+development flag, and ``test_production_serve_refuses_without_database`` pins
+that MemoryStorage is never selected implicitly.
 """
 
 from __future__ import annotations
 
+import inspect
 import os
 import uuid
 from typing import Any, Optional
@@ -21,7 +27,12 @@ from typing import Any, Optional
 import pytest
 from fastapi.testclient import TestClient as _TC
 
-from api.serve import _dns_run_tool, create_serve_app, serve_factory
+from api.serve import (
+    ServeConfigurationError,
+    _dns_run_tool,
+    create_serve_app,
+    serve_factory,
+)
 
 
 class _Task:
@@ -31,18 +42,29 @@ class _Task:
 
 
 def test_serve_factory_is_zero_arg() -> None:
-    app = serve_factory()
-    assert app is not None
+    assert not inspect.signature(serve_factory).parameters
+
+
+def test_production_serve_refuses_without_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production storage is PostgreSQL; there is no implicit MemoryStorage."""
+    monkeypatch.delenv("ARGUS_API_KEY", raising=False)
+    monkeypatch.delenv("ARGUS_DATABASE_URL", raising=False)
+    with pytest.raises(ServeConfigurationError) as exc:
+        create_serve_app(api_key="phase-13")
+    assert "ARGUS_DATABASE_URL" in str(exc.value)
+    assert "in_memory=True" in str(exc.value)
 
 
 def test_create_serve_app_healthz_open() -> None:
-    app = create_serve_app(api_key="phase-13")
+    app = create_serve_app(api_key="phase-13", in_memory=True)
     with _TC(app) as client:
         assert client.get("/_healthz").status_code == 200
 
 
 def test_create_serve_app_requires_bearer_on_protected() -> None:
-    app = create_serve_app(api_key="phase-13")
+    app = create_serve_app(api_key="phase-13", in_memory=True)
     with _TC(app) as client:
         r = client.get("/api/v1/runs")
         assert r.status_code == 401
@@ -51,7 +73,7 @@ def test_create_serve_app_requires_bearer_on_protected() -> None:
 
 
 def test_create_serve_app_accepts_committed_key() -> None:
-    app = create_serve_app(api_key="phase-13")
+    app = create_serve_app(api_key="phase-13", in_memory=True)
     with _TC(app) as client:
         r = client.get("/api/v1/runs", headers={"Authorization": "Bearer phase-13"})
         assert r.status_code == 200
@@ -59,7 +81,7 @@ def test_create_serve_app_accepts_committed_key() -> None:
 
 def test_api_key_precedence_env_over_arg(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ARGUS_API_KEY", "env-key")
-    app = create_serve_app(api_key="arg-key")
+    app = create_serve_app(api_key="arg-key", in_memory=True)
     with _TC(app) as client:
         assert (
             client.get("/api/v1/runs", headers={"Authorization": "Bearer arg-key"}).status_code
@@ -74,7 +96,7 @@ def test_api_key_precedence_env_over_arg(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_api_key_env_over_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ARGUS_API_KEY", raising=False)
     monkeypatch.setenv("ARGUS_API_KEY", "env-key")
-    app = create_serve_app()
+    app = create_serve_app(in_memory=True)
     with _TC(app) as client:
         assert (
             client.get("/api/v1/runs", headers={"Authorization": "Bearer env-key"}).status_code

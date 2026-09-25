@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Optional, Sequence
 
 import psycopg
+from psycopg.rows import dict_row
 
 from core.config import Config
 
@@ -18,7 +19,17 @@ class DatabaseConnection:
 
     def connect(self) -> psycopg.Connection:
         if self._conn is None or self._conn.closed:
-            self._conn = psycopg.connect(self.url, row_factory=dict_row)
+            # autocommit: each repository operation is its own unit of work.
+            #
+            # psycopg3 otherwise leaves every write inside a single implicit
+            # transaction that is never committed, so a long-lived connection
+            # (which is exactly what ``create_serve_app`` builds) would sit
+            # "idle in transaction" forever holding row locks -- blocking
+            # migrations, other writers and VACUUM, and making nothing durable
+            # until some unrelated code happened to commit.
+            self._conn = psycopg.connect(
+                self.url, row_factory=dict_row, autocommit=True
+            )
         return self._conn
 
     def close(self) -> None:
