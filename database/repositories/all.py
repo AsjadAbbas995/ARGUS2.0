@@ -15,6 +15,7 @@ from database.models.entities import (
     AssetIp,
     DnsRecord,
     Evidence,
+    Hypothesis,
     Ip,
     Organization,
     Port,
@@ -80,6 +81,9 @@ class RunRepository(BaseRepository):
 
     def get(self, run_id) -> Optional[dict]:
         return self._fetch_one("SELECT * FROM runs WHERE id = %s", (run_id,))
+
+    def list_runs(self) -> list[dict]:
+        return self._fetch_all("SELECT * FROM runs ORDER BY created_at, id")
 
     def update_status(self, run_id, status: str) -> dict:
         cur = self.conn.execute(
@@ -328,6 +332,64 @@ class EvidenceRepository(BaseRepository):
         )
 
 
+class HypothesisRepository(BaseRepository):
+    """Canonical ``hypotheses`` table access (05_DATA_MODEL.md).
+
+    Hypotheses are run-scoped review items: every read and write is qualified by
+    ``run_id`` so one run can never observe or mutate another run's hypotheses.
+    Analytical state (``truth_label``/``status``) and operator review state
+    (``review_status``/``review_reason``) are persisted as independent columns.
+    """
+
+    def insert(self, hypothesis: Hypothesis) -> dict:
+        return self._insert(
+            "hypotheses",
+            {
+                "id": hypothesis.id,
+                "run_id": hypothesis.run_id,
+                "endpoint_id": hypothesis.endpoint_id,
+                "statement": hypothesis.statement,
+                "truth_label": hypothesis.truth_label,
+                "confidence": hypothesis.confidence,
+                "severity": hypothesis.severity,
+                "priority": hypothesis.priority,
+                "status": hypothesis.status,
+                "target": hypothesis.target,
+                "validation_step": hypothesis.validation_step,
+                "review_status": hypothesis.review_status,
+                "review_reason": hypothesis.review_reason,
+            },
+        )
+
+    def get(self, run_id, hypothesis_id) -> Optional[dict]:
+        return self._fetch_one(
+            "SELECT * FROM hypotheses WHERE run_id = %s AND id = %s",
+            (run_id, hypothesis_id),
+        )
+
+    def list_for_run(self, run_id) -> list[dict]:
+        return self._fetch_all(
+            "SELECT * FROM hypotheses WHERE run_id = %s ORDER BY id", (run_id,)
+        )
+
+    def set_review(
+        self,
+        run_id,
+        hypothesis_id,
+        review_status: str,
+        review_reason: Optional[str],
+        truth_label: str,
+        status: str,
+    ) -> Optional[dict]:
+        cur = self.conn.execute(
+            "UPDATE hypotheses SET review_status = %s, review_reason = %s, "
+            "truth_label = %s, status = %s "
+            "WHERE run_id = %s AND id = %s RETURNING *",
+            (review_status, review_reason, truth_label, status, run_id, hypothesis_id),
+        )
+        return cur.fetchone()
+
+
 class Repositories:
     """Aggregate facade over all repositories sharing one connection."""
 
@@ -346,3 +408,4 @@ class Repositories:
         self.tasks = TaskRepository(conn)
         self.tool_runs = ToolRunRepository(conn)
         self.evidence = EvidenceRepository(conn)
+        self.hypotheses = HypothesisRepository(conn)

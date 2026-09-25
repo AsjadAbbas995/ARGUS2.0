@@ -16,6 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api.server import create_app
+from database.models.entities import Run
 
 _API_KEY = "phase-10"
 _AUTH = {"Authorization": "Bearer " + _API_KEY}
@@ -52,14 +53,18 @@ class _RecordingOrchestrator:
         self.tasks = {}
         self.created = []
 
-    def create_run(self, program_id: str = "", target: str = "") -> _FakeRun:
-        run = _FakeRun(target=target, program_id=program_id)
-        self.runs[str(run.id)] = run
-        self.created.append(str(run.id))
-        return run
+    def create_run(self, run: Run) -> _FakeRun:
+        stored = _FakeRun(target=run.target, program_id=str(run.program_id))
+        stored.status = run.status
+        self.runs[str(stored.id)] = stored
+        self.created.append(str(stored.id))
+        return stored
 
     def get_run(self, run_id: UUID) -> Optional[_FakeRun]:
         return self.runs.get(str(run_id))
+
+    def list_runs(self) -> list:
+        return list(self.runs.values())
 
     def list_tasks(self, run_id: UUID):
         return self.tasks.get(str(run_id), [])
@@ -82,7 +87,7 @@ def orchestrated() -> tuple:
 
 def _seed(orchestrated):
     c, fake = orchestrated
-    run = fake.create_run(target="example.com")
+    run = fake.create_run(Run(target="example.com"))
     fake.tasks[str(run.id)] = [
         _FakeTask(run.id, "subdomain_enum", "example.com", "completed"),
         _FakeTask(run.id, "http_probe", "example.com", "running"),
@@ -113,7 +118,7 @@ def test_create_run_contract(orchestrated) -> None:
         r = client.post("/api/v1/runs", json={"target": "example.com"}, headers=_AUTH)
         assert r.status_code == 201
         body = r.json()
-        assert body["status"] == "created"
+        assert body["status"] == "CREATED"
         assert body["target"] == "example.com"
 
 

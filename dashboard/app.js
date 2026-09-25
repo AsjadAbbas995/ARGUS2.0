@@ -105,7 +105,7 @@
 
   function hypothesisCard(h) {
     var card = document.createElement("article");
-    card.className = "card " + h.status;
+    card.className = "card " + h.review_status;
     card.dataset.hid = h.id;
 
     var head = document.createElement("div");
@@ -159,13 +159,13 @@
 
   function refreshReview(card, payload) {
     if (!payload) { return; }
-    card.className = "card " + payload.status;
+    card.className = "card " + payload.review_status;
     card.dataset.hid = payload.id;
     var acts = card.querySelectorAll(".actrow button");
     for (var i = 0; i < acts.length; i += 1) { acts[i].disabled = true; }
     var p = document.createElement("p");
     p.className = "meta";
-    p.textContent = "recorded: " + payload.status + (payload.reason ? " -- " + payload.reason : "");
+    p.textContent = "recorded: " + payload.review_status + (payload.review_reason ? " -- " + payload.review_reason : "");
     card.appendChild(p);
     clearWarn();
   }

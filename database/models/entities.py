@@ -2,7 +2,13 @@
 
 Maps the ``05_DATA_MODEL.md`` tables that Milestone 1 touches: organizations,
 programs, runs, scope_rules, assets, dns_records, ips, asset_ips, ports, web_apps,
-tasks, tool_runs, evidence.
+tasks, tool_runs, evidence, hypotheses.
+
+``Hypothesis`` is the canonical persistent hypothesis record backing the
+``hypotheses`` table. It is distinct from the AI-layer ``ai.context.HypothesisRecord``,
+which is an immutable agent input/output DTO and never persisted directly. Analytical
+state (``truth_label`` / ``status``) and operator review state
+(``review_status`` / ``review_reason``) are stored independently.
 """
 
 from __future__ import annotations
@@ -146,3 +152,20 @@ class Evidence:
     entity_type: str = ""
     entity_id: Optional[UUID] = None
     raw_reference: Optional[str] = None
+
+
+@dataclass
+class Hypothesis:
+    id: UUID = field(default_factory=_uuid)
+    run_id: UUID = field(default_factory=_uuid)
+    endpoint_id: Optional[UUID] = None
+    statement: str = ""
+    truth_label: str = "HYPOTHESIS"
+    confidence: float = 0.0
+    severity: str = "low"
+    priority: str = "low"
+    status: str = "open"
+    target: str = ""
+    validation_step: str = ""
+    review_status: str = "pending"
+    review_reason: Optional[str] = None

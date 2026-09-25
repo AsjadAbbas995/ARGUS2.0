@@ -10,8 +10,9 @@ HTTP layer.
 from __future__ import annotations
 
 from typing import Mapping, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
+from database.models.entities import Run
 from reports import json_report
 
 
@@ -27,8 +28,14 @@ def _task_payload(task) -> Mapping[str, str]:
 
 def create_run_handler(orchestrator, payload: Mapping) -> Mapping[str, str]:
     target = str(payload.get("target", "")).strip()
+    if not target:
+        raise ValueError("target is required")
     program_id = str(payload.get("program_id", "")).strip()
-    run = orchestrator.create_run(program_id=program_id, target=target)
+    try:
+        program_uuid = UUID(program_id) if program_id else uuid4()
+    except ValueError as exc:
+        raise ValueError("program_id must be a UUID") from exc
+    run = orchestrator.create_run(Run(program_id=program_uuid, target=target))
     return {
         "id": str(run.id),
         "program_id": str(run.program_id),

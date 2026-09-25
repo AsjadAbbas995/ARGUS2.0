@@ -17,7 +17,7 @@ import pytest
 
 from core.orchestrator import Orchestrator, OrchestratorError, Storage
 from core.task_planner import order_tasks, task_fingerprint
-from database.models.entities import Run, Task, ToolRun
+from database.models.entities import Hypothesis, Run, Task, ToolRun
 
 
 def _now() -> datetime:
@@ -31,6 +31,7 @@ class FakeStorage(Storage):
     runs: dict[UUID, Run] = field(default_factory=dict)
     tasks: dict[UUID, Task] = field(default_factory=dict)
     tool_runs: dict[UUID, ToolRun] = field(default_factory=dict)
+    hypotheses: dict[UUID, Hypothesis] = field(default_factory=dict)
     run_status_calls: list[tuple[UUID, str]] = field(default_factory=list)
     task_status_calls: list[tuple[UUID, str]] = field(default_factory=list)
 
@@ -42,6 +43,9 @@ class FakeStorage(Storage):
 
     def get_run(self, run_id: UUID) -> Optional[Run]:
         return self.runs.get(run_id)
+
+    def list_runs(self) -> list[Run]:
+        return list(self.runs.values())
 
     def set_run_status(self, run_id: UUID, status: str) -> None:
         if run_id in self.runs:
@@ -69,6 +73,45 @@ class FakeStorage(Storage):
 
     def insert_tool_run(self, tr: ToolRun) -> None:
         self.tool_runs[tr.id] = replace(tr)
+
+    # -- hypotheses ---------------------------------------------------------
+
+    def insert_hypothesis(self, hypothesis: Hypothesis) -> Hypothesis:
+        self.hypotheses[hypothesis.id] = replace(hypothesis)
+        return self.hypotheses[hypothesis.id]
+
+    def get_hypothesis(
+        self, run_id: UUID, hypothesis_id: UUID
+    ) -> Optional[Hypothesis]:
+        hypothesis = self.hypotheses.get(hypothesis_id)
+        if hypothesis is None or hypothesis.run_id != run_id:
+            return None
+        return hypothesis
+
+    def list_hypotheses(self, run_id: UUID) -> list[Hypothesis]:
+        return [h for h in self.hypotheses.values() if h.run_id == run_id]
+
+    def set_hypothesis_review(
+        self,
+        run_id: UUID,
+        hypothesis_id: UUID,
+        review_status: str,
+        review_reason: Optional[str],
+        truth_label: str,
+        status: str,
+    ) -> Optional[Hypothesis]:
+        current = self.get_hypothesis(run_id, hypothesis_id)
+        if current is None:
+            return None
+        updated = replace(
+            current,
+            review_status=review_status,
+            review_reason=review_reason,
+            truth_label=truth_label,
+            status=status,
+        )
+        self.hypotheses[hypothesis_id] = updated
+        return updated
 
 
 def _run() -> Run:
