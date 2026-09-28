@@ -27,12 +27,19 @@ graceful instability/safety limit. Without a hook the phase-5 linear walk is unc
 
 from __future__ import annotations
 
+import inspect
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 from uuid import UUID
 
+from core.config import ScopeConfig
+from core.rate_limiter import RateLimiter
+from core.scope_guard import ScopeGuard, extract_host
 from core.task_planner import order_tasks, plan_tasks
 from database.models.entities import Hypothesis, Run, Task, ToolRun
+
+log = logging.getLogger(__name__)
 
 # Run-level state machine, in legal forward order (08_ORCHESTRATOR.md).
 _RUN_STEPS = [
@@ -49,6 +56,22 @@ _RUN_STEPS = [
 ]
 _RUN_TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
 _TASK_RUNNABLE = {"pending"}
+#: A task counts as "done" for dependency gating only once it genuinely succeeded.
+#: Mirrors ``task_planner._FINISHED``; a failed or skipped parent does not unblock
+#: its children, because doing so would execute work whose input never arrived.
+_TASK_COMPLETED = {"completed"}
+#: Statuses that mean the task actually began doing work, so ``started_at`` is
+#: stamped on entry. ``skipped`` is deliberately absent: a task refused by the
+#: scope guard never ran, and must not look as though it did.
+_TASK_STARTED = {"running", "completed", "failed"}
+#: Statuses that end a task's lifecycle, so ``completed_at`` is stamped. Mirrors
+#: the ``tasks.status`` CHECK in migration 0001. The storage implementations import
+#: this so PostgreSQL and the in-memory double record identical lifecycle
+#: timestamps -- if they drift, their task histories stop being comparable.
+_TASK_TERMINAL = {"completed", "failed", "skipped", "cancelled"}
+#: Statuses that must never be re-queued by a planning pass: either the work is
+#: finished, deliberately abandoned, or still legitimately in flight.
+_TASK_SETTLED = {"completed", "skipped", "cancelled", "running"}
 
 # A Phase-8 adaptive-loop analysis hook: given the run and its current task list, it proposes
 # new reconnaissance tasks (the planner re-fingerprints and dedupes them). ``None`` disables
@@ -78,6 +101,16 @@ class Storage:
     def get_run(self, run_id: UUID) -> Optional[Run]: ...
     def list_runs(self) -> list[Run]: ...
     def set_run_status(self, run_id: UUID, status: str) -> None: ...
+    def set_run_progress(
+        self, run_id: UUID, loop_pass: int, pass_new_tasks: bool
+    ) -> None:
+        """Persist adaptive-loop progress (Phase 8) so it survives a restart.
+
+        Optional: a ``Storage`` predating Phase 8 need not implement it, and the
+        orchestrator falls back to process-local state when it is absent, which
+        keeps existing third-party/in-test doubles valid.
+        """
+        ...
 
     def insert_tasks(self, tasks: Iterable[Task]) -> None: ...
     def list_tasks(self, run_id: UUID) -> list[Task]: ...
@@ -111,15 +144,40 @@ class Orchestrator:
     run_tool: Callable[[Task], ToolRun]  # (task) -> ToolRun; Phase-5 deterministic demos
     analysis: Optional[AnalysisHook] = None  # Phase-8 adaptive loop; None keeps Phase-5 behaviour
     max_loop_passes: int = 32  # instability/safety limit (01_PRODUCT_SPEC.md §10)
+    scope: Optional[ScopeGuard] = None
+    """Safety guard enforced *before* any tool runs.
+
+    ``None`` means "no scope enforcement", preserving the Phase-5/8 behaviour the
+    existing tests pin. When set, a task whose ``target`` is denied is marked
+    ``skipped`` and never handed to ``run_tool``. ``api/serve.py`` builds this per
+    run from the run's own ``configuration_snapshot["scope"]`` so the run cannot
+    execute outside the scope it was created with.
+    """
+    rate_limiter: Optional[RateLimiter] = None
+    """Optional per-host/per-tool limiter applied around every ``run_tool`` call."""
     _loop_pass: int = field(default=0, init=False, repr=False, compare=False)
     _pass_new_tasks: bool = field(default=False, init=False, repr=False, compare=False)
+    _run_tool_accepts_scope: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        # ``run_tool`` is a one-argument seam (``task -> ToolRun``) pinned by the
+        # Phase-5/8 tests. Adapters that validate scope themselves (the ``recon``
+        # tools) can also accept a ``scope=`` keyword, so probe the signature once
+        # and hand the run's real guard to those adapters. Single-argument
+        # ``run_tool`` callables keep working unchanged.
+        try:
+            params = inspect.signature(self.run_tool).parameters
+        except (TypeError, ValueError):  # builtins / C callables
+            self._run_tool_accepts_scope = False
+            return
+        self._run_tool_accepts_scope = "scope" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
 
     # -- run lifecycle ------------------------------------------------------
 
     def create_run(self, run: Run, planned: Iterable[Task] = ()) -> Run:
         """Persist a new run (CREATED) and, if given, seed its first planned tasks."""
-        self._loop_pass = 0
-        self._pass_new_tasks = False
         stored = self.storage.create_run(run)
         self.storage.set_run_status(stored.id, "CREATED")
         if planned:
@@ -137,6 +195,11 @@ class Orchestrator:
 
         Returns the ordered task list. Tasks whose fingerprint already completed are dropped by
         the planner (``plan_tasks``); the orchestrator just persists whatever the planner emits.
+
+        A re-issued *non-completed* fingerprint is a **retry** ("no lost work"), not a new task.
+        ``plan_tasks`` re-emits it, but persisting that would collide with the
+        ``tasks_run_fingerprint_uq`` partial unique index (0003), so the existing row is
+        re-queued in place instead of inserting a duplicate.
         """
         existing = self.storage.list_tasks(run.id)
         ordered = plan_tasks(
@@ -145,7 +208,17 @@ class Orchestrator:
             existing,
             config=run.configuration_snapshot or {},
         )
-        self.storage.insert_tasks(ordered)
+        by_fingerprint = {t.fingerprint: t for t in existing if t.fingerprint}
+        fresh: list[Task] = []
+        for task in ordered:
+            prior = by_fingerprint.get(task.fingerprint) if task.fingerprint else None
+            if prior is not None:
+                if prior.status not in _TASK_SETTLED:
+                    self.storage.set_task_status(prior.id, "pending")
+                continue
+            fresh.append(task)
+        if fresh:
+            self.storage.insert_tasks(fresh)
         return ordered
 
     # -- deterministic walk ------------------------------------------------
@@ -173,15 +246,48 @@ class Orchestrator:
         08_ORCHESTRATOR.md). ``plan`` deliberately re-issues pending/in-flight/failed
         fingerprints ("no lost work", Phase 5), so the signal is the set of fingerprints the
         pass introduced that were not present in *any* status before it.
+
+        Both the pass counter and the signal are written back to the run so a restart resumes
+        the loop where it stopped instead of replaying the full pass budget.
         """
-        self._loop_pass += 1
         run = self._require_run(run_id)
+        loop_pass, _prior_signal = self._loop_progress(run)
         before = {t.fingerprint for t in self.storage.list_tasks(run.id) if t.fingerprint}
         proposed = self.analysis(run, self.storage.list_tasks(run.id))
         self.plan(run, proposed)
         after = {t.fingerprint for t in self.storage.list_tasks(run.id) if t.fingerprint}
-        self._pass_new_tasks = bool(after - before)
-        return self._pass_new_tasks
+        produced_new = bool(after - before)
+        self._save_loop_progress(run.id, loop_pass + 1, produced_new)
+        return produced_new
+
+    def _save_loop_progress(self, run_id: UUID, loop_pass: int, new_tasks: bool) -> None:
+        """Write loop progress to storage, falling back to process-local state.
+
+        ``set_run_progress`` is an optional part of the storage contract, so a
+        ``Storage`` that does not override it still works -- it just remains as
+        restart-fragile as it always was, instead of raising.
+        """
+        if not self._has_durable_loop_progress():
+            self._loop_pass = loop_pass
+            self._pass_new_tasks = new_tasks
+            return
+        self.storage.set_run_progress(run_id, loop_pass, new_tasks)
+
+    def _has_durable_loop_progress(self) -> bool:
+        """Whether this storage actually persists loop progress.
+
+        Checks for a real *override* rather than mere presence: ``Storage`` itself
+        declares ``set_run_progress`` as an optional no-op, so a storage that
+        inherits the stub without implementing it must not be treated as durable
+        (its progress would be silently discarded).
+        """
+        return getattr(type(self.storage), "set_run_progress", None) is not Storage.set_run_progress
+
+    def _loop_progress(self, run: Run) -> tuple[int, bool]:
+        """Loop progress for ``run``: from the persisted run when it is durable."""
+        if not self._has_durable_loop_progress():
+            return self._loop_pass, self._pass_new_tasks
+        return run.loop_pass, run.pass_new_tasks
 
     def _next_pass(self, run_id: UUID) -> str:
         """Adaptive-loop stop decision at ``WAITING_FOR_NEXT_TASK`` (08_ORCHESTRATOR.md).
@@ -189,11 +295,13 @@ class Orchestrator:
         Re-enter ``RECONNING`` while a pass generated new (non-duplicate) tasks; reach
         ``COMPLETED`` once re-analysis produces nothing new. ``max_loop_passes`` is the
         instability/safety limit — exceeding it ends the run gracefully as ``CANCELLED``
-        (01_PRODUCT_SPEC.md ??10). Without an ``analysis`` hook the run always completes,
+        (01_PRODUCT_SPEC.md §10). Without an ``analysis`` hook the run always completes,
         preserving Phase-5 behaviour.
         """
-        if self.analysis is not None and self._pass_new_tasks:
-            if self._loop_pass >= self.max_loop_passes:
+        run = self._require_run(run_id)
+        loop_pass, pass_new_tasks = self._loop_progress(run)
+        if self.analysis is not None and pass_new_tasks:
+            if loop_pass >= self.max_loop_passes:
                 self.storage.set_run_status(run_id, "CANCELLED")
                 return "CANCELLED"
             self.storage.set_run_status(run_id, "RECONNING")
@@ -226,8 +334,11 @@ class Orchestrator:
             if run.status == "EXECUTING":
                 if self._execute_pending(run, tool):
                     continue
-                if not self._has_pending(run):
-                    self._advance_step(run_id)
+                # Nothing ran, so nothing more can run in this pass: the remaining
+                # pending tasks are either excluded by the ``tool`` filter or still
+                # blocked on an unfinished parent. Walking the state machine forward
+                # is the only way out -- waiting for them here would spin forever.
+                self._advance_step(run_id)
                 continue
             self._advance_step(run_id)
 
@@ -242,8 +353,12 @@ class Orchestrator:
         regenerated; everything else is re-issued, so nothing is lost.
         """
         for task in self.storage.list_tasks_by_status(run_id, "running"):
+            # Two distinct, non-redundant transitions. First record that the task
+            # did not survive the interruption (an in-flight task must never be
+            # assumed complete), then re-queue it so the next EXECUTING pass
+            # retries it. The third, duplicated ``pending`` write this used to
+            # perform was a pure no-op that also re-stamped nothing.
             self.storage.set_task_status(task.id, "failed")
-            self.storage.set_task_status(task.id, "pending")
             self.storage.set_task_status(task.id, "pending")
         run = self._require_run(run_id)
         if run.status in _RUN_TERMINAL:
@@ -316,17 +431,105 @@ class Orchestrator:
             raise RunNotFoundError(f"unknown run {run_id}")
         return run
 
-    def _has_pending(self, run: Run) -> bool:
-        return any(t.status in _TASK_RUNNABLE for t in self.storage.list_tasks(run.id))
+    def _runnable_tasks(self, run: Run, tool: Optional[str]) -> list[Task]:
+        """Pending tasks that may run *now*, in deterministic order.
+
+        Two filters, both long-overdue:
+
+        * ``tool`` -- the caller-supplied tool filter that ``advance``/
+          ``run_to_completion`` document but used to ignore entirely; a mismatched
+          task must not execute.
+        * ``parent_task_id`` -- ``order_tasks`` only *sorts* parents before
+          children, it never gates execution, so a child of an unfinished parent
+          used to run anyway. Gating happens in ``_execute_pending`` against a live
+          ``done`` set, because a parent earlier in the same batch satisfies its
+          own children without costing an extra pass.
+        """
+        pending = [t for t in self.storage.list_tasks(run.id) if t.status in _TASK_RUNNABLE]
+        if tool is not None:
+            pending = [t for t in pending if t.type == tool]
+        if not pending:
+            return []
+        return order_tasks(pending)
+
+    def _scope_for(self, run: Run) -> Optional[ScopeGuard]:
+        """The safety guard in force for ``run``, or ``None`` if it is unscoped.
+
+        An explicitly injected ``scope`` always wins. Otherwise the run's own
+        ``configuration_snapshot["scope"]`` is authoritative, so a run is confined
+        to the scope it was created with even after a restart or in a different
+        process -- the snapshot is what travels with the run.
+
+        A run whose snapshot declares no ``scope`` key is left unenforced: the
+        Phase-5/8 behaviour the existing tests pin. Note that this is *not* the
+        same as an empty scope, which denies everything -- a run that asks for an
+        empty scope is a configuration mistake, and silently allowing it would be
+        the unsafe reading of the same word.
+        """
+        if self.scope is not None:
+            return self.scope
+        snapshot = run.configuration_snapshot or {}
+        if "scope" not in snapshot:
+            return None
+        return ScopeGuard.from_config(ScopeConfig.from_dict(snapshot.get("scope")))
 
     def _execute_pending(self, run: Run, tool: Optional[str]) -> bool:
-        pending = [t for t in self.storage.list_tasks(run.id) if t.status in _TASK_RUNNABLE]
-        if not pending:
+        ordered = self._runnable_tasks(run, tool)
+        if not ordered:
             return False
-        ordered = order_tasks(pending)
+        scope = self._scope_for(run)
+        all_tasks = self.storage.list_tasks(run.id)
+        known = {t.id for t in all_tasks}
+        done = {t.id for t in all_tasks if t.status in _TASK_COMPLETED}
+        executed = False
         for task in ordered:
+            # Dependency gate: a parent that is still in flight (or failed) leaves
+            # this child for a later pass rather than running it against input that
+            # does not exist yet. A dangling parent id is not waited on forever.
+            if (
+                task.parent_task_id is not None
+                and task.parent_task_id in known
+                and task.parent_task_id not in done
+            ):
+                continue
+            # Safety first: a denied target is never handed to a tool. Marked
+            # ``skipped`` (not ``failed``) because it was never attempted; the
+            # planner re-proposes it, but an existing fingerprint is not "new
+            # work", so the adaptive loop still terminates.
+            if scope is not None:
+                decision = scope.check(task.target)
+                if not decision:
+                    log.info("skipping out-of-scope task %s: %s", task.id, decision.reason)
+                    self.storage.set_task_status(task.id, "skipped")
+                    executed = True
+                    continue
             self.storage.set_task_status(task.id, "running")
-            tr = self.run_tool(task)
+            try:
+                tr = self._call_tool(task, scope)
+            except Exception as exc:  # noqa: BLE001 - a failing tool must not wedge the run
+                # Previously an exception escaped here leaving the task stuck in
+                # ``running`` forever: nothing was pending afterwards, so the run
+                # sat in EXECUTING and could never complete or resume. Record the
+                # failure and keep the run moving.
+                log.warning("task %s (%s) failed: %s", task.id, task.type, exc)
+                self.storage.set_task_status(task.id, "failed")
+                executed = True
+                continue
             self.storage.insert_tool_run(tr)
             self.storage.set_task_status(task.id, "completed")
-        return True
+            done.add(task.id)
+            executed = True
+        return executed
+
+    def _call_tool(self, task: Task, scope: Optional[ScopeGuard]) -> ToolRun:
+        """Invoke ``run_tool`` under the rate limiter, passing scope when supported."""
+        host = extract_host(task.target) if self.rate_limiter is not None else None
+        if self.rate_limiter is not None:
+            self.rate_limiter.acquire(host=host, tool=task.type)
+        try:
+            if self._run_tool_accepts_scope and scope is not None:
+                return self.run_tool(task, scope=scope)  # type: ignore[call-arg]
+            return self.run_tool(task)
+        finally:
+            if self.rate_limiter is not None:
+                self.rate_limiter.release(host=host, tool=task.type)

@@ -119,7 +119,7 @@ def _run() -> Run:
         program_id=uuid4(),
         status="CREATED",
         target="example.com",
-        configuration_snapshot={"scope": {"domains": ["example.com"]}},
+        configuration_snapshot={"scope": {"allowed_domains": ["example.com"]}},
     )
 
 

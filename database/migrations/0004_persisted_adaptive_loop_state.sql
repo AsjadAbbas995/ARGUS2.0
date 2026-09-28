@@ -1,0 +1,33 @@
+-- ARGUS migration 0004 (up): persist the adaptive recon loop's progress.
+--
+-- The Phase-8 adaptive loop kept its two control variables -- the pass counter
+-- and the "did this pass produce new work" signal -- as process-local
+-- attributes on the ``Orchestrator`` dataclass (``_loop_pass`` /
+-- ``_pass_new_tasks``). Everything else about a run lived in PostgreSQL, so
+-- those two were the only facts about a run that did not survive a restart:
+--
+--   * a resumed run restarted the counter at 0, discarding the
+--     ``max_loop_passes`` instability budget already spent and letting a
+--     pathological run loop far more than the documented limit across
+--     restarts;
+--   * a resumed run reported ``pass_new_tasks = False``, so
+--     ``_next_pass`` took the "no new work" branch and completed the run even
+--     if the last pass had in fact generated tasks -- losing the loop.
+--
+-- Both values are properties of the run, not of the process, so they belong in
+-- the ``runs`` row that already carries the run's status checkpoint. The
+-- orchestrator now reads them from the run and writes them back after every
+-- analysis pass, which is what makes ``resume()`` loop-aware.
+--
+-- Defaults are deliberately non-null and zero/empty: an existing run that has
+-- never run an analysis pass is exactly "pass 0, no new tasks", which is the
+-- value it must read back as. The columns are added without a default-then-drop
+-- dance so the rewrite stays a single cheap, non-blocking statement on modern
+-- PostgreSQL (adding a constant default no longer rewrites the table).
+--
+-- No index is added: loop progress is only ever read together with the run's own
+-- primary key (``get_run``), so a secondary index could never be used and would
+-- only add write amplification to the pass that updates it.
+ALTER TABLE runs
+    ADD COLUMN IF NOT EXISTS loop_pass integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS pass_new_tasks boolean NOT NULL DEFAULT false;

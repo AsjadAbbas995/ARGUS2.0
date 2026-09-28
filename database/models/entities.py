@@ -53,6 +53,11 @@ class Run:
     completed_at: Optional[datetime] = None
     created_at: datetime = field(default_factory=_now)
     updated_at: datetime = field(default_factory=_now)
+    # Phase-8 adaptive-loop progress. These are properties of the *run*, not of
+    # the process driving it, so they are persisted on the run row: a resumed run
+    # must not restart its pass budget or forget that the last pass produced work.
+    loop_pass: int = 0
+    pass_new_tasks: bool = False
 
 
 @dataclass

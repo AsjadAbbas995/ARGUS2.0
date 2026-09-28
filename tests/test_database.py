@@ -19,6 +19,7 @@ from database.models.entities import (
     AssetIp,
     DnsRecord,
     Evidence,
+    Hypothesis,
     Ip,
     Organization,
     Port,
@@ -80,6 +81,8 @@ DOC_COLUMNS: dict[str, list[str]] = {
         "completed_at",
         "created_at",
         "updated_at",
+        "loop_pass",
+        "pass_new_tasks",
     ],
     "scope_rules": ["id", "program_id", "rule_type", "value", "allowed"],
     "assets": ["id", "program_id", "hostname", "source", "discovered_at"],
@@ -112,6 +115,11 @@ DOC_COLUMNS: dict[str, list[str]] = {
         "severity",
         "priority",
         "status",
+        "run_id",
+        "target",
+        "validation_step",
+        "review_status",
+        "review_reason",
     ],
     "evidence": ["id", "tool_run_id", "entity_type", "entity_id", "raw_reference"],
     "tasks": [
@@ -162,6 +170,10 @@ MODEL_CLASSES = {
     "tasks": Task,
     "tool_runs": ToolRun,
     "evidence": Evidence,
+    # ``hypotheses`` belongs here: migration 0002 widened it, and while it was
+    # missing from this map the entity<->doc check could not catch the
+    # documentation drift that followed.
+    "hypotheses": Hypothesis,
 }
 
 
@@ -173,6 +185,28 @@ def _table_sql(text: str, table: str) -> str:
     )
     assert match is not None, f"CREATE TABLE {table} not found"
     return match.group(1)
+
+
+def _columns_added_by_later_migrations(table: str) -> set[str]:
+    """Columns later migrations add to ``table`` (``ALTER TABLE ... ADD COLUMN``).
+
+    The documented schema is the schema *after every migration*, not the 0001
+    shape, so these must be folded into the SQL comparison below. Migrations that
+    drop or rename columns are not handled here and would need this extended.
+    """
+    added: set[str] = set()
+    for path in migration_files():
+        if path.name.startswith("0001_"):
+            continue
+        sql = path.read_text(encoding="utf-8")
+        for statement in re.findall(
+            rf"ALTER TABLE\s+{table}\s+(.*?);", sql, re.S | re.I
+        ):
+            for match in re.finditer(
+                r"ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)", statement, re.I
+            ):
+                added.add(match.group(1))
+    return added
 
 
 @pytest.mark.parametrize("table", DOC_TABLES)
@@ -191,6 +225,7 @@ def test_sql_has_exactly_documented_columns(table: str) -> None:
         for name in re.findall(r"(?m)^\s*(\w+)\s+\w", fragment)
         if name not in {"PRIMARY", "FOREIGN", "UNIQUE", "CHECK", "CONSTRAINT"}
     }
+    defined |= _columns_added_by_later_migrations(table)
     assert defined == set(expected), (
         f"{table}: SQL columns {defined ^ set(expected)} differ from doc"
     )

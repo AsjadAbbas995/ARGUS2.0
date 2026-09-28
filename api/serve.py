@@ -129,9 +129,17 @@ def create_serve_app(
         store = MemoryStorage()
     else:
         store = _postgres_storage(database_url or os.environ.get(DATABASE_URL_ENV))
+    # The ``scope=`` keyword is load-bearing: the orchestrator probes this
+    # signature and hands over the run's real guard, so the adapter validates
+    # against the scope the run was created with. Without it the adapter fell
+    # back to its own empty ``ScopeConfig()``, which denies every target, making
+    # production execution fail closed with no possible cause. The orchestrator
+    # still enforces scope itself, before the tool is reached.
     orch = Orchestrator(
         storage=store,
-        run_tool=lambda task: _dns_run_tool(task, resolver_fn=resolver_fn),
+        run_tool=lambda task, scope=None: _dns_run_tool(
+            task, resolver_fn=resolver_fn, scope=scope
+        ),
     )
     return create_app(orch, api_key=effective_key)
 

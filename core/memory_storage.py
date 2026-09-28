@@ -17,11 +17,22 @@ this or a real repository-backed ``Storage`` is injected.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from typing import Iterable, Optional
 from uuid import UUID
 
-from core.orchestrator import Storage
+from core.orchestrator import (
+    Storage,
+    _RUN_TERMINAL,
+    _TASK_STARTED,
+    _TASK_TERMINAL,
+)
 from database.models.entities import Hypothesis, Run, Task, ToolRun
+
+
+def _now() -> datetime:
+    """Same clock the entities and PostgreSQL's ``now()`` agree on (UTC)."""
+    return datetime.now(timezone.utc)
 
 
 def _copy(entity):
@@ -55,8 +66,28 @@ class MemoryStorage(Storage):
         return [replace(run) for run in self._runs.values()]
 
     def set_run_status(self, run_id: UUID, status: str) -> None:
-        if run_id in self._runs:
-            self._runs[run_id] = replace(self._runs[run_id], status=status)
+        run = self._runs.get(run_id)
+        if run is None:
+            return
+        # Mirrors RunRepository.update_status, which stamps completed_at when the
+        # run reaches a terminal status.
+        updates: dict = {"status": status}
+        if status in _RUN_TERMINAL and run.completed_at is None:
+            updates["completed_at"] = _now()
+        self._runs[run_id] = replace(run, **updates)
+
+    def set_run_progress(
+        self, run_id: UUID, loop_pass: int, pass_new_tasks: bool
+    ) -> None:
+        # Mirrors RunRepository.update_loop_progress. Implemented for real (not
+        # left as the inherited no-op) so the in-memory backend has the same
+        # restart-durable loop semantics as PostgreSQL.
+        run = self._runs.get(run_id)
+        if run is None:
+            return
+        self._runs[run_id] = replace(
+            run, loop_pass=loop_pass, pass_new_tasks=pass_new_tasks, updated_at=_now()
+        )
 
     # -- tasks ---------------------------------------------------------------
 
@@ -75,8 +106,23 @@ class MemoryStorage(Storage):
         ]
 
     def set_task_status(self, task_id: UUID, status: str) -> None:
-        if task_id in self._tasks:
-            self._tasks[task_id] = replace(self._tasks[task_id], status=status)
+        task = self._tasks.get(task_id)
+        if task is None:
+            return
+        # Mirrors TaskRepository.update_status, which stamps
+        # ``started_at = COALESCE(started_at, now())`` on entry to a started
+        # status, ``completed_at = now()`` on a terminal status, and clears
+        # ``completed_at`` when a task is re-queued for retry. Without this the
+        # in-memory double recorded no lifecycle timestamps at all and silently
+        # diverged from PostgreSQL.
+        updates: dict = {"status": status}
+        if status in _TASK_STARTED and task.started_at is None:
+            updates["started_at"] = _now()
+        if status in _TASK_TERMINAL and task.completed_at is None:
+            updates["completed_at"] = _now()
+        elif status == "pending":
+            updates["completed_at"] = None
+        self._tasks[task_id] = replace(task, **updates)
 
     # -- tool runs -----------------------------------------------------------
 

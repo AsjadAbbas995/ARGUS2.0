@@ -20,7 +20,7 @@ from uuid import UUID
 
 import psycopg
 
-from core.orchestrator import Storage
+from core.orchestrator import Storage, _RUN_TERMINAL, _TASK_STARTED, _TASK_TERMINAL
 from database.models.entities import (
     Asset,
     AssetIp,
@@ -65,6 +65,8 @@ def _run_from_row(row: Optional[Mapping[str, Any]]) -> Optional[Run]:
         completed_at=row["completed_at"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        loop_pass=row["loop_pass"],
+        pass_new_tasks=row["pass_new_tasks"],
     )
 
 
@@ -172,6 +174,8 @@ class RunRepository(BaseRepository):
                 "completed_at": run.completed_at,
                 "created_at": run.created_at,
                 "updated_at": run.updated_at,
+                "loop_pass": run.loop_pass,
+                "pass_new_tasks": run.pass_new_tasks,
             },
         )
 
@@ -182,9 +186,23 @@ class RunRepository(BaseRepository):
         return self._fetch_all("SELECT * FROM runs ORDER BY created_at, id")
 
     def update_status(self, run_id, status: str) -> dict:
+        # Terminal run statuses must stamp completed_at; otherwise a finished run
+        # is indistinguishable from one that was abandoned mid-flight.
+        completed_sql = ", completed_at = now()" if status in _RUN_TERMINAL else ""
         cur = self.conn.execute(
-            "UPDATE runs SET status = %s, updated_at = now() WHERE id = %s RETURNING *",
+            f"UPDATE runs SET status = %s, updated_at = now() {completed_sql} "
+            "WHERE id = %s RETURNING *",
             (status, run_id),
+        )
+        return cur.fetchone()
+
+    def update_loop_progress(
+        self, run_id, loop_pass: int, pass_new_tasks: bool
+    ) -> dict:
+        cur = self.conn.execute(
+            "UPDATE runs SET loop_pass = %s, pass_new_tasks = %s, updated_at = now() "
+            "WHERE id = %s RETURNING *",
+            (loop_pass, pass_new_tasks, run_id),
         )
         return cur.fetchone()
 
@@ -382,12 +400,20 @@ class TaskRepository(BaseRepository):
         )
 
     def update_status(self, task_id, status: str, completed: bool = False) -> dict:
-        completed_sql = ", completed_at = now()" if completed else ""
+        sets = ["status = %s"]
+        params: list = [status]
+        if status in _TASK_STARTED:
+            sets.append("started_at = COALESCE(started_at, now())")
+        if completed:
+            sets.append("completed_at = now()")
+        elif status == "pending":
+            # Re-queued for retry ("no lost work"): the task is not finished, so a
+            # completed_at left over from a previous attempt must not survive.
+            sets.append("completed_at = NULL")
+        params.append(task_id)
         cur = self.conn.execute(
-            f"UPDATE tasks SET status = %s, "
-            f"started_at = COALESCE(started_at, now()) {completed_sql} "
-            f"WHERE id = %s RETURNING *",
-            (status, task_id),
+            f"UPDATE tasks SET {', '.join(sets)} WHERE id = %s RETURNING *",
+            tuple(params),
         )
         return cur.fetchone()
 
@@ -533,6 +559,11 @@ class Repositories(Storage):
     def set_run_status(self, run_id: UUID, status: str) -> None:
         self.runs.update_status(run_id, status)
 
+    def set_run_progress(
+        self, run_id: UUID, loop_pass: int, pass_new_tasks: bool
+    ) -> None:
+        self.runs.update_loop_progress(run_id, loop_pass, pass_new_tasks)
+
     def insert_tasks(self, tasks: Iterable[Task]) -> None:
         for task in tasks:
             self.tasks.insert(task)
@@ -544,7 +575,12 @@ class Repositories(Storage):
         return [_task_from_row(row) for row in self.tasks.list_by_status(run_id, status)]
 
     def set_task_status(self, task_id: UUID, status: str) -> None:
-        self.tasks.update_status(task_id, status)
+        # Terminal statuses must stamp ``completed_at``. Previously the flag was
+        # never passed, so ``completed_at`` stayed NULL for every task in both
+        # PostgreSQL and memory -- the lifecycle record the data model promises.
+        self.tasks.update_status(
+            task_id, status, completed=status in _TASK_TERMINAL
+        )
 
     def insert_tool_run(self, tr: ToolRun) -> ToolRun:
         return _tool_run_from_row(self.tool_runs.insert(tr))
