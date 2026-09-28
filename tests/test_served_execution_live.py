@@ -1,4 +1,4 @@
-"""Stage 3: end-to-end proof of the *served* execution path against real PostgreSQL.
+﻿"""Stage 3: end-to-end proof of the *served* execution path against real PostgreSQL.
 
 Skipped automatically when ``ARGUS_TEST_DATABASE_URL`` is unset/unreachable (see
 ``conftest.py``), like the rest of the live suite. With the DSN set, every test in
@@ -39,7 +39,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Sequence
 from uuid import UUID, uuid4
 
 import psycopg
@@ -194,14 +194,20 @@ def _config(
     )
 
 
-@pytest.fixture
-def program_id(database_url: str) -> Iterator[str]:
-    """A real organization + program, created through the production repositories.
+def _make_program(
+    database_url: str,
+    *,
+    rules: Sequence[tuple[str, str, bool]] = (("ip", LOOPBACK, True),),
+) -> str:
+    """Create a real organization + program + its persisted ``scope_rules``.
 
-    ``runs.program_id`` is a foreign key, so a served run cannot exist without one.
-    The fix under test is that the API refuses to invent a program rather than
-    letting the database reject the row.
+    Phase 13.1 (F-02) makes the program's ``scope_rules`` the authorization
+    boundary, so a program with no rules authorizes nothing and every target is
+    denied. The default rules here allow the controlled loopback target, which is
+    what lets the execution tests proceed at all -- the scope arrives from the
+    database now, exactly as a real engagement's would.
     """
+    from database.models.entities import ScopeRule as ScopeRuleEntity
     from database.repositories.all import Repositories
     from database.repositories.base import DatabaseConnection
 
@@ -214,9 +220,36 @@ def program_id(database_url: str) -> Iterator[str]:
         program = repositories.programs.upsert(
             organization["id"], f"argus-stage3-program-{uuid4().hex}"
         )
-        yield str(program["id"])
+        for rule_type, value, allowed in rules:
+            repositories.scope_rules.upsert(
+                ScopeRuleEntity(
+                    program_id=program["id"],
+                    rule_type=rule_type,
+                    value=value,
+                    allowed=allowed,
+                )
+            )
+        return str(program["id"])
     finally:
         connection.close()
+
+
+@pytest.fixture
+def program_id(database_url: str) -> Iterator[str]:
+    """A real program whose persisted scope authorizes the controlled target.
+
+    ``runs.program_id`` is a foreign key, so a served run cannot exist without one.
+    The fix under test is that the API refuses to invent a program rather than
+    letting the database reject the row. Its ``scope_rules`` are the authorization
+    boundary the run's ``configuration_snapshot`` is derived from.
+    """
+    yield _make_program(database_url)
+
+
+@pytest.fixture
+def unscoped_program_id(database_url: str) -> Iterator[str]:
+    """A real program with **no** scope rules: it authorizes nothing."""
+    yield _make_program(database_url, rules=())
 
 
 @pytest.fixture
@@ -364,16 +397,244 @@ def test_out_of_scope_target_never_reaches_a_subprocess(client, target, program_
     assert target.hits == [], "an out-of-scope target reached the network"
 
 
-def test_empty_scope_fails_closed(client, target, program_id):
-    """An empty scope denies everything; it is not read as "unscoped"."""
+def _persisted_scope(database_url: str, run_id: str) -> dict:
+    """The scope actually stored on the run row, read straight from PostgreSQL.
+
+    The API deliberately does not echo ``configuration_snapshot`` back to callers,
+    so the durable record is read from the database -- which is also the only place
+    it matters, since this is what survives a restart and what the next process
+    enforces.
+    """
+    with psycopg.connect(database_url, row_factory=dict_row) as connection:
+        row = connection.execute(
+            "SELECT configuration_snapshot FROM runs WHERE id = %s", (run_id,)
+        ).fetchone()
+    assert row is not None, f"run {run_id} is not persisted"
+    return row["configuration_snapshot"]["scope"]
+
+
+def test_empty_scope_does_not_erase_program_scope(
+    client, target, program_id, database_url
+):
+    """Phase 13.1 (F-02, requirement C): ``{}`` cannot delete a program's authority.
+
+    The snapshot is built from the program's persisted ``scope_rules``, so a caller
+    that sends an empty scope -- which pre-13.1 replaced the whole boundary and so
+    meant "no restrictions" -- now leaves the program's scope intact and the
+    in-scope target still executes.
+    """
     test_client, probes, _ = client
     run = _create_run(test_client, program_id, configuration={"scope": {}})
+    run_id = run["id"]
+    assert _persisted_scope(database_url, run_id)["allowed_ips"] == [LOOPBACK], (
+        "an empty caller scope must not overwrite the program's persisted scope"
+    )
+    _enqueue(test_client, run_id, "http_probe", target.url)
+
+    result = test_client.post(f"/api/v1/runs/{run_id}/run", json={}, headers=_auth())
+    assert result.json()["tasks"]["by_status"] == {"completed": 1}
+    assert len(probes) == 1
+
+
+def test_unscoped_program_authorizes_nothing(client, target, unscoped_program_id):
+    """Fail closed: a program with no ``scope_rules`` is never read as "unscoped".
+
+    The empty scope below is what a caller sends, and it is explicitly *not* a way to
+    unlock a program the operator never scoped.
+    """
+    test_client, probes, _ = client
+    run = _create_run(test_client, unscoped_program_id, configuration={"scope": {}})
     run_id = run["id"]
     _enqueue(test_client, run_id, "http_probe", target.url)
 
     result = test_client.post(f"/api/v1/runs/{run_id}/run", json={}, headers=_auth())
     assert result.json()["tasks"]["by_status"] == {"skipped": 1}
     assert probes == []
+    assert target.hits == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 13.1 / F-02: the program's persisted scope_rules are the boundary
+# ---------------------------------------------------------------------------
+
+
+def test_caller_cannot_widen_the_program_scope(client, target, program_id):
+    """Phase 13.1 (F-02, requirement B): a request may not grant itself reach.
+
+    The program authorizes ``127.0.0.1`` only. A caller asking for a different IP is
+    refused at intake with a 422, and nothing is stored or executed.
+    """
+    test_client, probes, _ = client
+    before = test_client.get("/api/v1/runs", headers=_auth()).json()["count"]
+    response = test_client.post(
+        "/api/v1/runs",
+        json={
+            "target": f"http://{LOOPBACK}/",
+            "program_id": program_id,
+            "configuration": {"scope": {"allowed_ips": ["203.0.113.9"]}},
+        },
+        headers=_auth(),
+    )
+    assert response.status_code == 422, response.text
+    assert "203.0.113.9" in response.text
+    after = test_client.get("/api/v1/runs", headers=_auth()).json()["count"]
+    assert after == before, "a rejected widening request must not store a run"
+    assert probes == []
+
+
+def test_caller_cannot_widen_the_program_domain_scope(
+    client, target, program_id, database_url
+):
+    """The same rule for domain-scoped programs, not just IP ones."""
+    from database.models.entities import ScopeRule as ScopeRuleEntity
+    from database.repositories.all import Repositories
+    from database.repositories.base import DatabaseConnection
+
+    connection = DatabaseConnection(database_url)
+    repositories = Repositories(connection.connect())
+    try:
+        program = repositories.programs.upsert(
+            repositories.organizations.upsert(f"org-{uuid4().hex}")["id"],
+            f"prog-{uuid4().hex}",
+        )
+        for value in ("example.com",):
+            repositories.scope_rules.upsert(
+                ScopeRuleEntity(
+                    program_id=program["id"], rule_type="domain", value=value, allowed=True
+                )
+            )
+        program_id = str(program["id"])
+    finally:
+        connection.close()
+
+    test_client, _, _ = client
+    # In the program's scope: accepted, and the effective scope is the program's.
+    allowed = test_client.post(
+        "/api/v1/runs",
+        json={
+            "target": "https://www.example.com/",
+            "program_id": program_id,
+            "configuration": {"scope": {"allowed_domains": ["www.example.com"]}},
+        },
+        headers=_auth(),
+    )
+    assert allowed.status_code == 201, allowed.text
+    assert _persisted_scope(database_url, allowed.json()["id"])["allowed_domains"] == [
+        "example.com"
+    ]
+
+    # Outside it: refused. The request cannot name its own reach.
+    refused = test_client.post(
+        "/api/v1/runs",
+        json={
+            "target": "https://attacker.example.net/",
+            "program_id": program_id,
+            "configuration": {"scope": {"allowed_domains": ["attacker.example.net"]}},
+        },
+        headers=_auth(),
+    )
+    assert refused.status_code == 422, refused.text
+
+
+def test_omitted_scope_still_uses_the_program_rules(
+    client, target, program_id, database_url
+):
+    """Phase 13.1 (F-02, requirement D): no caller scope at all is the common case.
+
+    A request that says nothing about scope must still execute under the program's
+    persisted rules -- not under some server default, and not unenforced.
+    """
+    test_client, probes, _ = client
+    response = test_client.post(
+        "/api/v1/runs",
+        json={"target": f"http://{LOOPBACK}/", "program_id": program_id},
+        headers=_auth(),
+    )
+    assert response.status_code == 201, response.text
+    run_id = response.json()["id"]
+    assert _persisted_scope(database_url, run_id)["allowed_ips"] == [LOOPBACK]
+    _enqueue(test_client, run_id, "http_probe", target.url)
+
+    result = test_client.post(f"/api/v1/runs/{run_id}/run", json={}, headers=_auth())
+    assert result.json()["tasks"]["by_status"] == {"completed": 1}
+    assert len(probes) == 1
+
+
+def test_effective_scope_is_persisted_and_reloaded_by_a_new_process(
+    client, target, program_id, database_url, tmp_path
+):
+    """Phase 13.1 (F-02, requirement E): the snapshot is the durable source of truth.
+
+    A *second* served app is built against the same database with a served policy that
+    does **not** include the target at all, and its served configuration endpoint
+    reports that narrow policy. The run still completes, because the boundary that
+    governs it travelled in ``runs.configuration_snapshot`` -- written from the
+    program's ``scope_rules`` -- rather than living in either process.
+    """
+    test_client, _, _ = client
+    response = test_client.post(
+        "/api/v1/runs",
+        json={"target": f"http://{LOOPBACK}/", "program_id": program_id},
+        headers=_auth(),
+    )
+    assert response.status_code == 201, response.text
+    run_id = response.json()["id"]
+    _enqueue(test_client, run_id, "http_probe", target.url)
+
+    probes: list[LocalHttpProbeAdapter] = []
+    second_app = create_serve_app(
+        api_key="stage3-key",
+        database_url=database_url,
+        # Deliberately authorizes a different host than the run's own snapshot.
+        config=_config(
+            database_url, allowed_ips=("203.0.113.9",), raw_dir=tmp_path / "raw2"
+        ),
+        runner=ToolRunner(raw_dir=tmp_path / "raw2"),
+        adapters={"http_probe": _probe_factory(probes)},
+    )
+    with TestClient(second_app) as second:
+        # The second process holds a *different* served policy, yet the run's
+        # effective scope is still the one persisted from the program's rules.
+        assert second_app.state.argus_config.to_dict()["scope"]["allowed_ips"] == [
+            "203.0.113.9"
+        ]
+        assert second.get(
+            f"/api/v1/runs/{run_id}/configuration", headers=_auth()
+        ).json()["configuration_snapshot"]["scope"]["allowed_ips"] == [LOOPBACK]
+
+        executed = second.post(f"/api/v1/runs/{run_id}/run", json={}, headers=_auth())
+        assert executed.status_code == 200, executed.text
+        assert executed.json()["tasks"]["by_status"] == {"completed": 1}
+        assert len(probes) == 1
+    assert target.hits == ["/probe"]
+
+
+def test_scope_guard_denies_before_the_adapter_is_built(
+    client, target, unscoped_program_id, monkeypatch
+):
+    """Phase 13.1 (F-02, requirement F): the guard runs before any adapter exists.
+
+    ``ServedExecution.adapter_for`` is the point where a real tool is constructed and
+    a subprocess can start. It is replaced with a tripwire, and the task is enqueued
+    for a program that authorizes nothing: the task must be ``skipped`` and the
+    tripwire must never fire, which is only possible if the guard denied it first.
+    """
+    test_client, _, _ = client
+    run = _create_run(test_client, unscoped_program_id, configuration={"scope": {}})
+    run_id = run["id"]
+    _enqueue(test_client, run_id, "http_probe", target.url)
+
+    reached: list[str] = []
+
+    def _tripwire(self, task):
+        reached.append(task.type)
+        raise AssertionError("adapter_for was reached before the scope guard denied")
+
+    monkeypatch.setattr(ServedExecution, "adapter_for", _tripwire)
+
+    result = test_client.post(f"/api/v1/runs/{run_id}/run", json={}, headers=_auth())
+    assert result.json()["tasks"]["by_status"] == {"skipped": 1}
+    assert reached == [], "an adapter was constructed for an out-of-scope task"
     assert target.hits == []
 
 

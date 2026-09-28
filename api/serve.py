@@ -7,8 +7,14 @@ be served against the authoritative store from ``05_DATA_MODEL.md``.
 
 API key precedence:
   1. ``ARGUS_API_KEY`` environment variable
-  2. the ``api_key`` argument (used by ``create_serve_app``)
-  3. the committed default ``_API_KEY = "phase-10"`` from ``api.server``
+  2. the explicit ``api_key`` argument (used by controlled tests and embedders)
+
+There is deliberately **no** third fallback. A credential committed to the
+repository is published, not secret, and it gates the route that drives real
+network requests, so production startup fails loudly when no key is configured
+instead of authenticating on a guessable literal. A blank or whitespace-only key
+is treated as absent. The key is never logged, never persisted, and never placed
+in a run's ``configuration_snapshot``.
 
 Storage precedence:
   1. an explicitly injected ``storage`` (tests / embedding)
@@ -32,7 +38,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
-from api.server import _API_KEY, create_app
+from api.server import create_app
 from core.config import Config, ConfigError, DatabaseConfig, ScopeConfig
 from core.memory_storage import MemoryStorage
 from core.orchestrator import Orchestrator
@@ -48,6 +54,10 @@ from recon.web.httpx_probe import HttpxProbeAdapter
 #: variable name ``core.config.DatabaseConfig`` already reads.
 DATABASE_URL_ENV = "ARGUS_DATABASE_URL"
 
+#: Environment variable holding the operator API key. The served runtime has no
+#: default: without it, startup fails.
+API_KEY_ENV = "ARGUS_API_KEY"
+
 #: Task type -> adapter factory. Dispatch is by task type so a task is executed by
 #: the tool that actually implements it; previously every task type was routed to
 #: the DNS resolver, so an ``http_probe`` task silently produced a DNS result.
@@ -60,6 +70,31 @@ DEFAULT_HTTP_PROBE_TYPES: tuple[str, ...] = ("http_probe", "httpx", "web_probe")
 
 class ServeConfigurationError(RuntimeError):
     """Raised when the serve seam cannot build a production storage backend."""
+
+
+def _resolve_api_key(api_key: Optional[str]) -> str:
+    """The operator key the served runtime will authenticate against.
+
+    ``ARGUS_API_KEY`` wins over the explicit argument, and there is no third
+    source. A missing, empty or whitespace-only key raises
+    :class:`ServeConfigurationError` rather than yielding an app that would
+    either reject every request or, far worse, accept a guessable one.
+
+    The key is returned to the caller and stored only in
+    ``app.state.argus_api_key``. It is never logged, never written to the
+    database, and never included in a run's ``configuration_snapshot``.
+    """
+    raw = os.environ.get(API_KEY_ENV)
+    candidate = raw if raw is not None and raw.strip() else api_key
+    effective = str(candidate).strip() if candidate else ""
+    if not effective:
+        raise ServeConfigurationError(
+            f"production serve requires an API key: set {API_KEY_ENV} (or pass "
+            f"api_key=). There is no default credential -- a key committed to the "
+            f"repository is a published key, and it gates the route that runs real "
+            f"tools against real targets."
+        )
+    return effective
 
 
 class UnknownTaskType(ValueError):
@@ -277,11 +312,14 @@ def create_serve_app(
 ) -> "object":
     """Build the fully-wired FastAPI app for serving ARGUS.
 
-    ``api_key`` is used when ``ARGUS_API_KEY`` is unset, otherwise the committed
-    server default is used. ``storage``/``resolver_fn`` are optional injection
-    points for tests. With neither ``storage`` nor ``in_memory``, the app is
-    backed by PostgreSQL (``database_url`` or ``ARGUS_DATABASE_URL``) and refuses
-    to start if no database is configured.
+    ``api_key`` is used when ``ARGUS_API_KEY`` is unset. There is no fallback
+    credential: with neither the environment variable nor an explicit key,
+    startup raises :class:`ServeConfigurationError` rather than serving an API
+    protected by a value that is published in this repository.
+    ``storage``/``resolver_fn`` are optional injection points for tests. With
+    neither ``storage`` nor ``in_memory``, the app is backed by PostgreSQL
+    (``database_url`` or ``ARGUS_DATABASE_URL``) and refuses to start if no
+    database is configured.
 
     The composition wires the full documented execution chain, in order
     (``02_ARCHITECTURE.md``): ``Scope Guard -> Rate Limiter -> Tool Adapter ->
@@ -295,7 +333,9 @@ def create_serve_app(
       :func:`_default_adapters`; a controlled harness may inject an adapter that
       drives the real ``ToolRunner`` against a local target.
     """
-    effective_key = os.environ.get("ARGUS_API_KEY") or api_key or _API_KEY
+    # Authentication is a startup precondition, checked before anything is
+    # constructed: there is no committed default key to fall back to.
+    effective_key = _resolve_api_key(api_key)
     if storage is not None:
         store = storage
     elif in_memory:

@@ -5,10 +5,15 @@ committed deny-all/deny-by-default ``ScopeGuard.from_config(committed ScopeConfi
 and the committed in-process ``DnsResolverAdapter`` into the committed
 ``create_app`` FastAPI factory; ``_dns_run_tool``/``create_serve_app``/
 ``serve_factory`` construction order and API-key precedence
-(``output = env ARGUS_API_KEY or arg or committed _API_KEY``) are the seams.
+(``env ARGUS_API_KEY`` else explicit ``api_key``, **no fallback**) are the seams.
 No live DNS, no subprocess, no fabricated green: fixtures resolve in-process
 through the committed adapter's committed deny-default, and tests assert the
 **actual committed** fail-closed posture.
+
+Security posture (Phase 13.1): the served runtime has no committed default
+credential. ``test_production_serve_refuses_without_api_key`` and its blank-key
+sibling pin that startup fails rather than authenticating on a published
+literal.
 
 Storage posture (Stage 1): production ``create_serve_app`` is backed by
 PostgreSQL and raises ``ServeConfigurationError`` when no database is
@@ -79,7 +84,7 @@ def test_create_serve_app_accepts_committed_key() -> None:
         assert r.status_code == 200
 
 
-def test_api_key_precedence_env_over_arg(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_api_key_env_over_explicit_arg(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ARGUS_API_KEY", "env-key")
     app = create_serve_app(api_key="arg-key", in_memory=True)
     with _TC(app) as client:
@@ -93,15 +98,120 @@ def test_api_key_precedence_env_over_arg(monkeypatch: pytest.MonkeyPatch) -> Non
         )
 
 
-def test_api_key_env_over_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_production_serve_refuses_without_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 13.1 / F-01: no committed default credential exists.
+
+    ``serve_factory()`` takes no arguments, so the environment is the only place a
+    production key can come from. With it unset the served runtime must refuse to
+    start rather than fall back to a literal that is published in this repository.
+    """
     monkeypatch.delenv("ARGUS_API_KEY", raising=False)
+    with pytest.raises(ServeConfigurationError) as exc:
+        create_serve_app(in_memory=True)
+    assert "ARGUS_API_KEY" in str(exc.value)
+    assert "no default credential" in str(exc.value)
+
+
+def test_blank_api_key_is_treated_as_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty or whitespace-only key is not a way to serve a working API."""
+    monkeypatch.setenv("ARGUS_API_KEY", "   ")
+    with pytest.raises(ServeConfigurationError):
+        create_serve_app(in_memory=True)
+    monkeypatch.delenv("ARGUS_API_KEY", raising=False)
+    with pytest.raises(ServeConfigurationError):
+        create_serve_app(api_key="   ", in_memory=True)
+
+
+def test_serve_factory_requires_the_environment_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The zero-arg production entrypoint requires ``ARGUS_API_KEY``."""
+    monkeypatch.delenv("ARGUS_API_KEY", raising=False)
+    with pytest.raises(ServeConfigurationError) as exc:
+        serve_factory()
+    assert "ARGUS_API_KEY" in str(exc.value)
+    # With a key present it gets past authentication and on to storage, so a
+    # different (storage) failure is what surfaces -- never the key again.
+    monkeypatch.setenv("ARGUS_API_KEY", "env-key")
+    monkeypatch.setenv(
+        "ARGUS_DATABASE_URL", "postgresql://x:x@127.0.0.1:1/none?connect_timeout=2"
+    )
+    with pytest.raises(Exception) as exc:
+        serve_factory()
+    assert "ARGUS_API_KEY" not in str(exc.value)
+
+
+def test_api_key_env_alone_starts_successfully(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Phase 13.1 / F-01: a valid explicit environment key starts and authenticates."""
     monkeypatch.setenv("ARGUS_API_KEY", "env-key")
     app = create_serve_app(in_memory=True)
+    assert app.state.argus_api_key == "env-key"
     with _TC(app) as client:
         assert (
             client.get("/api/v1/runs", headers={"Authorization": "Bearer env-key"}).status_code
             == 200
         )
+        assert client.get("/api/v1/runs").status_code == 401
+        assert (
+            client.get(
+                "/api/v1/runs", headers={"Authorization": "Bearer wrong-key"}
+            ).status_code
+            == 401
+        )
+
+
+def test_published_phase10_literal_cannot_authenticate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 13.1 / F-01: the removed ``"phase-10"`` default is not a back door.
+
+    It is a literal anyone with the source can read, and it used to be the
+    production key whenever nothing was configured.
+    """
+    monkeypatch.delenv("ARGUS_API_KEY", raising=False)
+    app = create_serve_app(api_key="a-real-key", in_memory=True)
+    with _TC(app) as client:
+        assert (
+            client.get(
+                "/api/v1/runs", headers={"Authorization": "Bearer phase-10"}
+            ).status_code
+            == 401
+        )
+        assert (
+            client.get(
+                "/api/v1/runs", headers={"Authorization": "Bearer a-real-key"}
+            ).status_code
+            == 200
+        )
+
+
+def test_blank_key_app_fails_closed_on_every_protected_route() -> None:
+    """Defense in depth: a blank key authenticates nothing, not everything.
+
+    ``create_serve_app`` refuses a blank key outright, so this drives the lower
+    level ``create_app`` directly: if an embedder ever constructs one with an
+    empty key, every protected route must still reject rather than open.
+    """
+    from api.server import create_app
+    from core.memory_storage import MemoryStorage
+    from core.orchestrator import Orchestrator
+
+    def _never_runs(task, scope=None, config=None):  # pragma: no cover - never reached
+        raise AssertionError("no task may execute on an unauthenticated app")
+
+    app = create_app(
+        Orchestrator(storage=MemoryStorage(), run_tool=_never_runs), api_key=""
+    )
+    assert app.state.argus_api_key == ""
+    with _TC(app) as client:
+        for headers in (
+            {},
+            {"Authorization": "Bearer "},
+            {"Authorization": "Bearer anything"},
+        ):
+            assert client.get("/api/v1/runs", headers=headers).status_code == 401
 
 
 def test_dns_run_tool_fail_closed_out_of_scope_default() -> None:

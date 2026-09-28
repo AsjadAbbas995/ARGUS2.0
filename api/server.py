@@ -26,14 +26,24 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path as _ArgusRoot
 
-from core.config import ConfigError, run_snapshot_from_dict
+from core.config import ConfigError, ScopeConfig, run_snapshot_from_dict
 from core.orchestrator import BadRunTransition, Orchestrator, RunNotFoundError
+from core.scope_guard import ScopeGuard, ScopeRuleType
 from database.models.entities import Run, Task
 from reports import html_report, json_report, markdown_report
 
+#: ``scope_rules.rule_type`` values that can grant access, mapped onto the fields
+#: of ``core.config.ScopeConfig`` that ``ScopeGuard.from_config`` consumes. These
+#: are the only rule types that may contribute an *allow* to a run's effective
+#: scope. Everything else -- ``exclusion``, and any of the above carrying
+#: ``allowed = false`` -- contributes only an exclusion, which can never widen
+#: access. ``port`` has no ``ScopeConfig`` counterpart and is ignored, which is
+#: the same posture as today (``ScopeGuard.from_config`` never emits PORT rules).
+_SCOPE_ALLOW_DOMAINS = (ScopeRuleType.DOMAIN, ScopeRuleType.SUBDOMAIN)
+_SCOPE_ALLOW_IPS = (ScopeRuleType.IP, ScopeRuleType.CIDR)
+
 _LIVENESS = "/_healthz"
 _BEARER_PREFIX = "bearer "
-_API_KEY = "phase-10"
 
 
 def _run_payload(run) -> Mapping[str, str]:
@@ -88,19 +98,129 @@ def _hypotheses_payload(run_id, hyps) -> dict:
     }
 
 
-def _configuration_snapshot(app, payload: Mapping[str, object]) -> dict:
+def _has_program_scope_rules(orchestrator: Orchestrator) -> bool:
+    """Whether the orchestrator's storage exposes the authoritative ``scope_rules``.
+
+    Mirrors the ``_resolve_program`` probe: a storage with no ``programs`` table
+    has no program to own an authorization boundary, so there is nothing to
+    resolve and the caller's scope stands. The production ``Repositories``
+    exposes both, so production always takes the program-scope path.
+    """
+    storage = getattr(orchestrator, "storage", None)
+    return getattr(storage, "scope_rules", None) is not None
+
+
+def _program_scope(orchestrator: Orchestrator, program_id: UUID) -> dict:
+    """The authoritative scope for ``program_id``, from its persisted rules.
+
+    This is the flow ``04_SCOPE_SAFETY.md`` describes and that
+    ``core.scope_guard.ScopeGuard`` already documents as its contract: scope is
+    defined per ``programs`` and stored in ``scope_rules``, and the guard
+    "evaluates fixed ``scope_rules`` ... AI agents, parsers, and adapters cannot
+    override it". A program with no rules authorizes nothing, which is the
+    fail-closed reading: the run is created with an empty scope and every target
+    is denied.
+
+    ``allowed`` rules grant; ``exclusion`` rules and ``allowed = false`` rows deny.
+    """
+    storage = getattr(orchestrator, "storage", None)
+    rows = storage.scope_rules.list_for_program(program_id) or []
+    allowed_domains: list[str] = []
+    allowed_ips: list[str] = []
+    excluded: list[str] = []
+    for row in rows:
+        rule_type = str(row.get("rule_type", "")).strip().lower()
+        value = str(row.get("value", "")).strip()
+        if not value:
+            continue
+        allowed = bool(row.get("allowed", True))
+        if rule_type in _SCOPE_ALLOW_DOMAINS:
+            (allowed_domains if allowed else excluded).append(value.lower().rstrip("."))
+        elif rule_type in _SCOPE_ALLOW_IPS:
+            (allowed_ips if allowed else excluded).append(value)
+        elif rule_type == ScopeRuleType.EXCLUSION:
+            excluded.append(value)
+        # A 'port' rule has no ScopeConfig counterpart; ignoring it cannot widen
+        # access, and inventing a port boundary here is out of scope for this pass.
+    return {
+        "allowed_domains": sorted(set(allowed_domains)),
+        "allowed_ips": sorted(set(allowed_ips)),
+        "excluded": sorted(set(excluded)),
+    }
+
+
+def _reject_scope_broadening(requested: dict, program_scope: dict) -> None:
+    """Refuse a caller-supplied scope that reaches outside the program's.
+
+    The request may *select* a program and a target inside it; it may not
+    redefine what the program authorizes. Each requested allow entry is therefore
+    evaluated against a guard built from the program's own scope, and anything the
+    program does not already permit is a 422.
+
+    Entries the program does permit are accepted: a request for a strict subset
+    ("www.example.com" where the program allows "example.com") passes, because
+    the effective scope is the program's regardless -- narrowing a request here
+    does not silently grant it anything extra.
+    """
+    guard = ScopeGuard.from_config(ScopeConfig.from_dict(program_scope))
+    for field in ("allowed_domains", "allowed_ips"):
+        for entry in requested.get(field) or ():
+            if not guard.check(str(entry)):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"scope {field} entry {entry!r} is outside the program's "
+                        f"authorized scope; a run may narrow but never widen the "
+                        f"scope its program defines"
+                    ),
+                )
+
+
+def _effective_scope(
+    orchestrator: Orchestrator, program_id: UUID, requested: object
+) -> dict:
+    """The scope a new run will actually execute under.
+
+    The program's persisted rules are the boundary. A caller's scope object is
+    validated against that boundary and may contribute only *exclusions* -- and
+    because ``ScopeGuard`` already makes exclusions win over allows
+    (``core/scope_guard.py``), folding them in can only ever remove access. An
+    absent or empty caller scope therefore cannot erase program authorization,
+    and the two are never unioned into a wider set.
+    """
+    program_scope = _program_scope(orchestrator, program_id)
+    if not isinstance(requested, dict):
+        return program_scope
+    _reject_scope_broadening(requested, program_scope)
+    extra_excluded = [
+        str(value).strip() for value in (requested.get("excluded") or ()) if str(value).strip()
+    ]
+    if not extra_excluded:
+        return program_scope
+    return {
+        **program_scope,
+        "excluded": sorted(set(program_scope["excluded"]) | set(extra_excluded)),
+    }
+
+
+def _configuration_snapshot(
+    app, payload: Mapping[str, object], effective_scope: Optional[dict] = None
+) -> dict:
     """Build the ``configuration_snapshot`` stored on a new run.
 
     The snapshot must describe the configuration the run will *actually* execute
     with, so it is derived from the served policy and the request is applied as an
     overlay on top of it. Two rules follow from what is enforced at runtime:
 
-    * Sections the request mentions (``scope``, ``web``, ``network``, ...) override
-      the served policy for that run, so an operator can scope a run without
-      restarting the process. ``scope`` is *replaced* rather than merged: an
-      authorization boundary must be stated in full, never inherited field by field
-      from a broader policy. An explicit empty scope therefore denies everything
-      (fail closed) instead of silently keeping the served allowances.
+    * Sections the request mentions (``web``, ``network``, ...) override the
+      served policy for that run, so an operator can tune a run without
+      restarting the process. ``scope`` is not among them: it comes from the
+      program's persisted ``scope_rules`` (see :func:`_effective_scope`) and is
+      written verbatim, because it is the authorization boundary rather than a
+      tuning knob. An authorization boundary must be stated in full, never
+      inherited field by field from a broader policy -- and never assembled out
+      of a request. An effective empty scope therefore denies everything (fail
+      closed).
     * ``limits`` always comes from the served policy, because the rate limiter is a
       process-level component built once at start-up. Recording a per-run limit that
       nothing enforces would make the persisted row describe a throttle that is not
@@ -118,18 +238,24 @@ def _configuration_snapshot(app, payload: Mapping[str, object]) -> dict:
     if raw is not None and not isinstance(raw, dict):
         raise ConfigError("configuration must be a mapping")
     if served is None:
-        return run_snapshot_from_dict(raw)
+        merged: dict = run_snapshot_from_dict(raw)
+        if effective_scope is not None:
+            merged["scope"] = dict(effective_scope)
+        return run_snapshot_from_dict(merged)
 
     merged = served.to_dict()
     for section, value in (raw or {}).items():
         if section == "limits":
             continue  # enforced process-wide; see the docstring
         if section == "scope":
-            merged[section] = value  # an authorization boundary is stated in full
-        elif isinstance(value, dict) and isinstance(merged.get(section), dict):
+            continue  # replaced below from the program's scope_rules
+        if isinstance(value, dict) and isinstance(merged.get(section), dict):
             merged[section] = {**merged[section], **value}
         else:
             merged[section] = value
+    if effective_scope is not None:
+        # The boundary, written in full and last so nothing above can override it.
+        merged["scope"] = dict(effective_scope)
     return run_snapshot_from_dict(merged)
 
 
@@ -230,9 +356,24 @@ def _parse_tasks(run_id: UUID, payload: Mapping[str, object]) -> list[Task]:
     return tasks
 
 
-def create_app(orchestrator: Orchestrator, api_key: str = _API_KEY) -> FastAPI:
+def create_app(orchestrator: Orchestrator, api_key: str) -> FastAPI:
+    """Build the FastAPI control/read surface around ``orchestrator``.
+
+    ``api_key`` is **required** and has no default. There is deliberately no
+    committed fallback credential: a value published in the repository is not a
+    secret, and one that silently becomes the production key would let anyone
+    holding the source drive ``POST /runs/{id}/run`` -- i.e. the whole
+    ``Scope Guard -> Rate Limiter -> Adapter -> Tool Runner -> Target`` chain --
+    against a host of their choosing. Callers that want one supply it explicitly
+    (``api.serve.create_serve_app`` requires ``ARGUS_API_KEY`` in production).
+
+    A blank key is not a way to disable authentication: :func:`_authed` compares
+    against ``app.state.argus_api_key`` with ``secrets.compare_digest`` and
+    rejects when the expected value is empty, so a misconfigured key fails
+    closed on every protected route rather than opening them.
+    """
     app = FastAPI(title="ARGUS API", version="0.3.0")
-    app.state.argus_api_key = api_key
+    app.state.argus_api_key = str(api_key).strip() if api_key else ""
 
     import secrets
 
@@ -258,8 +399,25 @@ def create_app(orchestrator: Orchestrator, api_key: str = _API_KEY) -> FastAPI:
         program_uuid = _resolve_program(orchestrator, program_id)
         # The snapshot is validated before the run is stored: an invalid scope, port
         # range or limit is a 422 at intake, never a run that fails mid-execution.
+        # Everything that can raise ConfigError happens inside this try, so a
+        # malformed configuration is a 422 on every path rather than a 500.
         try:
-            snapshot = _configuration_snapshot(app, payload)
+            # The scope is resolved from the program's persisted `scope_rules` before
+            # the snapshot is built, so the row records the boundary that will
+            # actually be enforced. A caller's scope object is validated against it
+            # and can never widen it; with a storage that has no scope_rules there is
+            # no program-owned boundary, so the caller's scope stands (in-memory
+            # double path).
+            effective_scope = None
+            if _has_program_scope_rules(orchestrator):
+                configuration = payload.get("configuration")
+                if configuration is not None and not isinstance(configuration, dict):
+                    raise ConfigError("configuration must be a mapping")
+                requested_scope = (configuration or {}).get("scope")
+                if requested_scope is not None and not isinstance(requested_scope, dict):
+                    raise ConfigError("scope must be a mapping")
+                effective_scope = _effective_scope(orchestrator, program_uuid, requested_scope)
+            snapshot = _configuration_snapshot(app, payload, effective_scope)
         except ConfigError as exc:
             raise HTTPException(status_code=422, detail=f"invalid configuration: {exc}")
         run = Run(

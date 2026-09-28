@@ -18,7 +18,13 @@ from fastapi.testclient import TestClient
 from api.server import create_app
 from database.models.entities import Run
 
-_API_KEY = "phase-10"
+#: An explicit test key, passed by the caller. Production has no default credential
+#: (``api.serve.create_serve_app`` requires ``ARGUS_API_KEY``), so this constant is a
+#: value these tests choose -- not a fallback the app would use on its own. It is
+#: deliberately *not* the removed ``"phase-10"`` literal, which used to be the
+#: published production key and must stay recognizable only as a rejected back door
+#: in ``tests/test_serve.py``.
+_API_KEY = "test-api-key"
 _AUTH = {"Authorization": "Bearer " + _API_KEY}
 
 
