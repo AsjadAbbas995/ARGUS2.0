@@ -28,25 +28,139 @@ returning a ``FastAPI`` instance); it constructs the whole injection graph so
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Mapping, Optional
 
 from api.server import _API_KEY, create_app
-from core.config import ScopeConfig
+from core.config import Config, ConfigError, DatabaseConfig, ScopeConfig
 from core.memory_storage import MemoryStorage
 from core.orchestrator import Orchestrator
+from core.rate_limiter import RateLimiter
 from core.scope_guard import ScopeGuard, ScopeRule, ScopeRuleType
 from core.tool_runner import ToolRunner, ToolRunnerError
 from database.models.entities import ToolRun
+from recon.base import ToolAdapter
 from recon.dns.resolver import DnsResolverAdapter, make_resolver
+from recon.web.httpx_probe import HttpxProbeAdapter
 
 #: Environment variable holding the PostgreSQL URL for the served runtime. Same
 #: variable name ``core.config.DatabaseConfig`` already reads.
 DATABASE_URL_ENV = "ARGUS_DATABASE_URL"
 
+#: Task type -> adapter factory. Dispatch is by task type so a task is executed by
+#: the tool that actually implements it; previously every task type was routed to
+#: the DNS resolver, so an ``http_probe`` task silently produced a DNS result.
+#:
+#: A type that appears in neither tuple has no adapter and is refused. See
+#: :class:`UnknownTaskType`.
+DEFAULT_ADAPTER_TYPES: tuple[str, ...] = ("dns_resolve", "dns", "resolve")
+DEFAULT_HTTP_PROBE_TYPES: tuple[str, ...] = ("http_probe", "httpx", "web_probe")
+
 
 class ServeConfigurationError(RuntimeError):
     """Raised when the serve seam cannot build a production storage backend."""
+
+
+class UnknownTaskType(ValueError):
+    """No adapter is registered for this task type.
+
+    Raised *before* any adapter is constructed, so an unrecognised task type can
+    never be executed by some other tool. The orchestrator records the exception as a
+    task failure and keeps the run moving, which is the documented failure state.
+
+    This is a configuration fault, not a transient one: it is a ``ValueError`` so a
+    caller can distinguish "this run was misconfigured" from "the tool was missing".
+    """
+
+
+class ServedExecution:
+    """The served ``run_tool`` seam: task type -> adapter -> controlled Tool Runner.
+
+    This is the last boundary before a target. It preserves the documented trust
+    chain of ``02_ARCHITECTURE.md`` (``Scope Guard -> Rate Limiter -> Tool Adapter ->
+    Tool Runner -> Target``): the orchestrator has already enforced scope and taken a
+    rate-limit permit before this is called, and the adapter re-validates scope
+    itself (``ToolAdapter.validate``) because both are documented boundaries.
+
+    The runner is constructed once and reused so raw output lands under a single,
+    configured ``storage/raw`` root rather than a fresh default per task.
+    """
+
+    def __init__(
+        self,
+        *,
+        adapters: Mapping[str, Callable[[], ToolAdapter]],
+        runner: ToolRunner,
+        database_url: str = "",
+    ) -> None:
+        self._adapters = dict(adapters)
+        self._runner = runner
+        self._database_url = database_url or ""
+
+    def known_task_types(self) -> tuple[str, ...]:
+        """The task types this composition can execute, sorted."""
+        return tuple(sorted(self._adapters))
+
+    def adapter_for(self, task) -> ToolAdapter:
+        """The adapter that implements this task's type -- or a hard failure.
+
+        An unknown type is never routed to a substitute tool. Falling back to the DNS
+        resolver meant a typo, a task type from a newer planner, or an ``http_probe``
+        the composition did not know all silently produced a *DNS answer* recorded as a
+        successful probe: a wrong result reported as a success, which is worse than no
+        result at all. Refusing here happens before an adapter exists, so nothing is
+        constructed, no subprocess starts and no target is contacted.
+        """
+        task_type = getattr(task, "type", "")
+        factory = self._adapters.get(task_type)
+        if factory is None:
+            known = ", ".join(self.known_task_types()) or "(none registered)"
+            raise UnknownTaskType(
+                f"no adapter is registered for task type {task_type!r}; "
+                f"known task types: {known}"
+            )
+        return factory()
+
+    def execution_config(self, snapshot) -> Optional[Config]:
+        """Rebuild the typed configuration from the run's persisted snapshot.
+
+        The snapshot is the authoritative record of what the run was created with, so
+        the adapter is handed *that* configuration rather than a process-local
+        default. The snapshot deliberately carries no ``database`` section (see
+        ``core.config.run_snapshot_from_dict``), so the resolved serve-time URL is
+        supplied here purely to satisfy the ``Config`` shape.
+        """
+        if not isinstance(snapshot, dict) or not snapshot:
+            return None
+        data = dict(snapshot)
+        data["database"] = {"url": self._database_url or "unconfigured"}
+        try:
+            return Config.from_dict(data)
+        except ConfigError:
+            # A snapshot that no longer validates (e.g. a column edited by hand)
+            # must not silently fall back to permissive defaults: the adapter runs
+            # with no configuration, which for every committed adapter means the
+            # conservative default rather than an opened-up policy.
+            return None
+
+    def __call__(self, task, scope=None, config=None) -> ToolRun:
+        adapter = self.adapter_for(task)
+        execution = adapter.execute(
+            task,
+            runner=self._runner,
+            config=self.execution_config(config),
+            # An absent guard is deny-all, never permissive: an un-scoped seam fails
+            # closed rather than resolving something nobody authorized.
+            scope=scope if scope is not None else ScopeGuard.from_config(ScopeConfig()),
+        )
+        return ToolRun(
+            task_id=task.id,
+            tool_name=execution.tool,
+            command=list(execution.command),
+            exit_code=execution.exit_code,
+            raw_output_ref=execution.raw_output_ref,
+        )
 
 
 #: Inject the DNS resolution outcome into an ``Orchestrator.run_tool`` seam.
@@ -106,6 +220,49 @@ def _postgres_storage(database_url: Optional[str]):
     return Repositories(raw)
 
 
+def _effective_config(config: Optional[Config], database_url: str) -> Config:
+    """The typed configuration the served runtime executes with.
+
+    The serve runtime must always have a limits policy, because a served process
+    without a rate limiter is an unbounded fan-out. When no configuration is injected
+    (the normal deployment) the documented defaults are used, with the resolved
+    database URL filled in so the ``Config`` shape is complete. ``Config`` is built
+    directly rather than through ``from_dict`` so the absent-URL development mode
+    (``in_memory=True`` with no PostgreSQL configured) still yields a usable limits
+    policy instead of raising.
+    """
+    if config is not None:
+        return config
+    return replace(Config(), database=DatabaseConfig(url=database_url or ""))
+
+
+def _default_adapters(
+    resolver_fn, dns_timeout: float
+) -> dict[str, Callable[[], ToolAdapter]]:
+    """Build the default task-type -> adapter table.
+
+    Every type the served runtime will execute appears here explicitly. There is no
+    substitute: a type outside this table is refused by
+    :meth:`ServedExecution.adapter_for` rather than quietly run by another tool.
+
+    ``resolver_fn`` is the test/dev injection point for DNS answers; production uses
+    ``make_resolver`` (dnspython-style resolution through the standard library).
+    """
+    def dns() -> ToolAdapter:
+        return DnsResolverAdapter(
+            resolver_fn=resolver_fn or make_resolver(timeout=dns_timeout),
+            timeout=dns_timeout,
+        )
+
+    adapters: dict[str, Callable[[], ToolAdapter]] = {
+        kind: dns for kind in DEFAULT_ADAPTER_TYPES
+    }
+    adapters.update(
+        {kind: HttpxProbeAdapter for kind in DEFAULT_HTTP_PROBE_TYPES}
+    )
+    return adapters
+
+
 def create_serve_app(
     *,
     api_key: Optional[str] = None,
@@ -113,6 +270,10 @@ def create_serve_app(
     resolver_fn=None,
     database_url: Optional[str] = None,
     in_memory: bool = False,
+    config: Optional[Config] = None,
+    runner: Optional[ToolRunner] = None,
+    adapters: Optional[Mapping[str, Callable[[], ToolAdapter]]] = None,
+    dns_timeout: float = 3.0,
 ) -> "object":
     """Build the fully-wired FastAPI app for serving ARGUS.
 
@@ -121,6 +282,18 @@ def create_serve_app(
     points for tests. With neither ``storage`` nor ``in_memory``, the app is
     backed by PostgreSQL (``database_url`` or ``ARGUS_DATABASE_URL``) and refuses
     to start if no database is configured.
+
+    The composition wires the full documented execution chain, in order
+    (``02_ARCHITECTURE.md``): ``Scope Guard -> Rate Limiter -> Tool Adapter ->
+    Tool Runner -> Target``, with PostgreSQL on both sides.
+
+    * ``config`` supplies the typed policy. Its ``limits`` always produce a real
+      :class:`RateLimiter`; a served process never runs unthrottled.
+    * ``runner`` injects the controlled subprocess boundary and is reused for every
+      task so raw output lands under one configured ``storage.raw`` root.
+    * ``adapters`` overrides the task-type -> adapter table. Production uses
+      :func:`_default_adapters`; a controlled harness may inject an adapter that
+      drives the real ``ToolRunner`` against a local target.
     """
     effective_key = os.environ.get("ARGUS_API_KEY") or api_key or _API_KEY
     if storage is not None:
@@ -129,19 +302,50 @@ def create_serve_app(
         store = MemoryStorage()
     else:
         store = _postgres_storage(database_url or os.environ.get(DATABASE_URL_ENV))
-    # The ``scope=`` keyword is load-bearing: the orchestrator probes this
-    # signature and hands over the run's real guard, so the adapter validates
-    # against the scope the run was created with. Without it the adapter fell
-    # back to its own empty ``ScopeConfig()``, which denies every target, making
-    # production execution fail closed with no possible cause. The orchestrator
-    # still enforces scope itself, before the tool is reached.
+
+    resolved_url = database_url or os.environ.get(DATABASE_URL_ENV) or ""
+    effective_config = _effective_config(config, resolved_url)
+    tool_runner = runner if runner is not None else ToolRunner(
+        raw_dir=Path(effective_config.storage.raw_dir)
+    )
+
+    default_adapters = _default_adapters(resolver_fn, dns_timeout)
+    if adapters:
+        default_adapters.update(adapters)
+
+    execution = ServedExecution(
+        adapters=default_adapters,
+        runner=tool_runner,
+        database_url=resolved_url,
+    )
+    # A real limiter, always. Previously the served composition passed none, so every
+    # served execution bypassed the rate limiter the architecture documents.
+    limiter = RateLimiter.from_config(effective_config.limits)
+    # ``scope=`` is load-bearing: the orchestrator probes this signature and hands
+    # over the run's real guard, so the adapter validates against the scope the run
+    # was created with. Without it the adapter fell back to its own empty
+    # ``ScopeConfig()``, which denies every target, making production execution
+    # fail closed with no possible cause. The orchestrator still enforces scope
+    # itself, before the tool is reached. ``config=`` likewise carries the run's own
+    # persisted configuration into the adapter.
     orch = Orchestrator(
         storage=store,
-        run_tool=lambda task, scope=None: _dns_run_tool(
-            task, resolver_fn=resolver_fn, scope=scope
-        ),
+        run_tool=execution,
+        rate_limiter=limiter,
     )
-    return create_app(orch, api_key=effective_key)
+
+    app = create_app(orch, api_key=effective_key)
+    # Exposed so request handling and controlled harnesses can reach the wired
+    # runtime without reaching into the orchestrator: the API layer builds each
+    # run's ``configuration_snapshot`` from the served policy, and a restart test
+    # can rebuild the same wiring against the same database.
+    app.state.argus_config = effective_config
+    app.state.argus_database_url = resolved_url
+    app.state.argus_orchestrator = orch
+    app.state.argus_storage = store
+    app.state.argus_execution = execution
+    app.state.argus_rate_limiter = limiter
+    return app
 
 
 def serve_factory() -> "object":

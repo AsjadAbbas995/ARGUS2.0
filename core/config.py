@@ -403,6 +403,77 @@ class Config:
         return cls.from_dict(data)
 
 
+def run_snapshot_from_dict(data: dict[str, Any] | None) -> dict[str, Any]:
+    """Validate execution-relevant configuration into a ``runs.configuration_snapshot``.
+
+    ``05_DATA_MODEL.md`` §runs stores the configuration a run was created with so a
+    later process reproduces the same run instead of inventing its own. This builds
+    that payload and enforces two properties:
+
+    * **Validated.** Every section goes through the same ``from_dict`` validators the
+      YAML loader uses, so an invalid scope entry, port range or limit is rejected at
+      intake (fail closed) rather than discovered halfway through a run.
+    * **Credential-free.** The ``database`` section is deliberately never included.
+      :meth:`Config.to_dict` serializes it because it describes the whole process, but
+      a run row is durable, widely readable data, and a DSN routinely embeds a password.
+      A credential must never be persisted there.
+
+    The ``scope`` section is **always** present, even when empty. Combined with the
+    orchestrator's ``_scope_for`` that makes an unspecified scope deny-all (fail
+    closed) rather than silently widening to "unscoped".
+    """
+    if data is not None and not isinstance(data, dict):
+        raise ConfigError("run configuration must be a mapping")
+
+    scope = ScopeConfig.from_dict((data or {}).get("scope"))
+    limits = LimitsConfig.from_dict((data or {}).get("limits"))
+    network = NetworkConfig.from_dict((data or {}).get("network"))
+    recon = ReconConfig.from_dict((data or {}).get("recon"))
+    web = WebConfig.from_dict((data or {}).get("web"))
+    api = ApiConfig.from_dict((data or {}).get("api"))
+    outputs = OutputsConfig.from_dict((data or {}).get("outputs"))
+
+    return {
+        "scope": {
+            "allowed_domains": list(scope.allowed_domains),
+            "allowed_ips": list(scope.allowed_ips),
+            "excluded": list(scope.excluded),
+        },
+        "limits": {
+            "requests_per_second": limits.requests_per_second,
+            "concurrency": limits.concurrency,
+        },
+        "network": {
+            "tcp_ports": {
+                "start": network.tcp_ports.start,
+                "end": network.tcp_ports.end,
+            }
+        },
+        "recon": {
+            "aggressive_subdomain_discovery": recon.aggressive_subdomain_discovery,
+        },
+        "web": {
+            "http_probe": web.http_probe,
+            "crawling": web.crawling,
+            "content_discovery": web.content_discovery,
+            "historical_urls": web.historical_urls,
+        },
+        "api": {
+            "rest": api.rest,
+            "openapi": api.openapi,
+            "swagger": api.swagger,
+            "graphql": api.graphql,
+            "websocket": api.websocket,
+            "authentication_analysis": api.authentication_analysis,
+        },
+        "outputs": {
+            "json": outputs.json,
+            "markdown": outputs.markdown,
+            "html": outputs.html,
+        },
+    }
+
+
 def load_config(path: str | Path) -> Config:
     """Backwards-compatible entry point; forwards to :meth:`Config.load`."""
     return Config.load(path)

@@ -158,21 +158,28 @@ class Orchestrator:
     _loop_pass: int = field(default=0, init=False, repr=False, compare=False)
     _pass_new_tasks: bool = field(default=False, init=False, repr=False, compare=False)
     _run_tool_accepts_scope: bool = field(default=False, init=False, repr=False, compare=False)
+    _run_tool_accepts_config: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # ``run_tool`` is a one-argument seam (``task -> ToolRun``) pinned by the
         # Phase-5/8 tests. Adapters that validate scope themselves (the ``recon``
         # tools) can also accept a ``scope=`` keyword, so probe the signature once
-        # and hand the run's real guard to those adapters. Single-argument
-        # ``run_tool`` callables keep working unchanged.
+        # and hand the run's real guard to those adapters. A seam may equally accept
+        # ``config=``, which receives the run's own persisted configuration so the
+        # adapter executes with the configuration the run was created with rather
+        # than one the process happens to hold. Single-argument ``run_tool``
+        # callables keep working unchanged.
         try:
             params = inspect.signature(self.run_tool).parameters
         except (TypeError, ValueError):  # builtins / C callables
             self._run_tool_accepts_scope = False
+            self._run_tool_accepts_config = False
             return
-        self._run_tool_accepts_scope = "scope" in params or any(
+        takes_kwargs = any(
             p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
         )
+        self._run_tool_accepts_scope = "scope" in params or takes_kwargs
+        self._run_tool_accepts_config = "config" in params or takes_kwargs
 
     # -- run lifecycle ------------------------------------------------------
 
@@ -505,7 +512,9 @@ class Orchestrator:
                     continue
             self.storage.set_task_status(task.id, "running")
             try:
-                tr = self._call_tool(task, scope)
+                tr = self._call_tool(
+                    task, scope, getattr(run, "configuration_snapshot", None)
+                )
             except Exception as exc:  # noqa: BLE001 - a failing tool must not wedge the run
                 # Previously an exception escaped here leaving the task stuck in
                 # ``running`` forever: nothing was pending afterwards, so the run
@@ -521,14 +530,27 @@ class Orchestrator:
             executed = True
         return executed
 
-    def _call_tool(self, task: Task, scope: Optional[ScopeGuard]) -> ToolRun:
-        """Invoke ``run_tool`` under the rate limiter, passing scope when supported."""
+    def _call_tool(
+        self, task: Task, scope: Optional[ScopeGuard], config: Optional[dict] = None
+    ) -> ToolRun:
+        """Invoke ``run_tool`` under the rate limiter, passing scope/config when supported.
+
+        ``config`` is the run's own ``configuration_snapshot``. The orchestrator does
+        not interpret it -- the seam does, because only the seam knows the typed
+        configuration shape. It is handed over so the adapter executes with the
+        configuration the run was created with, not a process-local default.
+        """
         host = extract_host(task.target) if self.rate_limiter is not None else None
         if self.rate_limiter is not None:
             self.rate_limiter.acquire(host=host, tool=task.type)
         try:
+            kwargs = {}
             if self._run_tool_accepts_scope and scope is not None:
-                return self.run_tool(task, scope=scope)  # type: ignore[call-arg]
+                kwargs["scope"] = scope
+            if self._run_tool_accepts_config and config is not None:
+                kwargs["config"] = config
+            if kwargs:
+                return self.run_tool(task, **kwargs)  # type: ignore[call-arg]
             return self.run_tool(task)
         finally:
             if self.rate_limiter is not None:
