@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 from uuid import UUID
@@ -77,6 +78,51 @@ _TASK_SETTLED = {"completed", "skipped", "cancelled", "running"}
 # new reconnaissance tasks (the planner re-fingerprints and dedupes them). ``None`` disables
 # the loop entirely, preserving Phase-5 behaviour.
 AnalysisHook = Callable[["Run", list["Task"]], list["Task"]]
+
+
+@dataclass(frozen=True)
+class ToolRunOutcome:
+    """A seam result carrying the execution's normalized artifacts alongside its ToolRun.
+
+    Phase 14: seams that own the adapter (``api.serve.ServedExecution``) already hold
+    ``ToolExecution.artifacts``, which used to be discarded on the way out. Returning
+    this wrapper surfaces them **without** changing the pinned ``(task) -> ToolRun``
+    seam contract: the orchestrator still accepts a bare :class:`ToolRun` from every
+    existing seam and test double, and simply ingests nothing for it.
+    """
+
+    tool_run: ToolRun
+    artifacts: tuple = ()
+
+
+#: An ingestion callback supplied by the served wiring: it maps artifacts to
+#: canonical records and persists them with their evidence. It runs *inside* the
+#: orchestrator's transaction, so the ToolRun, the evidence, the graph rows and the
+#: task's terminal state commit or roll back together.
+IngestHook = Callable[["Task", ToolRun, tuple, "Run", Optional[ScopeGuard]], None]
+
+
+def _split_outcome(value: Any) -> tuple[ToolRun, tuple]:
+    """Accept either a bare ``ToolRun`` (every pre-Phase-14 seam) or a ``ToolRunOutcome``.
+
+    Backwards compatibility is the point: the Phase-5/8 seam contract is
+    ``(task) -> ToolRun`` and is pinned by existing tests, so Phase 14 reads the
+    artifacts only when a seam chooses to return them.
+    """
+    if isinstance(value, ToolRunOutcome):
+        return value.tool_run, tuple(value.artifacts)
+    return value, ()
+
+
+def _transaction_for(storage: Any):
+    """The storage's transaction context, or a no-op when it has none.
+
+    ``transaction()`` is optional on the ``Storage`` contract, exactly like
+    ``set_run_progress`` (Phase 8): a Storage predating Phase 14 -- including every
+    in-test double -- keeps the original non-atomic three-write sequence.
+    """
+    factory = getattr(storage, "transaction", None)
+    return factory() if callable(factory) else nullcontext()
 
 
 class OrchestratorError(Exception):
@@ -155,6 +201,17 @@ class Orchestrator:
     """
     rate_limiter: Optional[RateLimiter] = None
     """Optional per-host/per-tool limiter applied around every ``run_tool`` call."""
+    ingest: Optional[IngestHook] = None
+    """Optional Phase-14 evidence ingestion, applied inside the task transaction.
+
+    ``None`` preserves the pre-Phase-14 behaviour exactly: a ``ToolRun`` is
+    recorded and the task completes with no graph facts, which is what every
+    Phase-5/8 seam and test double relies on. When supplied, it is called with
+    ``(task, tool_run, artifacts, run, scope)`` and is expected to persist the
+    canonical records and their evidence through the *same* storage/transaction
+    that records the ``ToolRun``, so a failure can never leave a task marked
+    completed while its facts are missing.
+    """
     _loop_pass: int = field(default=0, init=False, repr=False, compare=False)
     _pass_new_tasks: bool = field(default=False, init=False, repr=False, compare=False)
     _run_tool_accepts_scope: bool = field(default=False, init=False, repr=False, compare=False)
@@ -512,7 +569,7 @@ class Orchestrator:
                     continue
             self.storage.set_task_status(task.id, "running")
             try:
-                tr = self._call_tool(
+                outcome = self._call_tool(
                     task, scope, getattr(run, "configuration_snapshot", None)
                 )
             except Exception as exc:  # noqa: BLE001 - a failing tool must not wedge the run
@@ -524,8 +581,28 @@ class Orchestrator:
                 self.storage.set_task_status(task.id, "failed")
                 executed = True
                 continue
-            self.storage.insert_tool_run(tr)
-            self.storage.set_task_status(task.id, "completed")
+            tool_run, artifacts = _split_outcome(outcome)
+            try:
+                # Phase 14: the ToolRun, the ingested evidence/graph facts and the
+                # task's terminal state are one atomic unit. A storage that
+                # provides ``transaction()`` gets it; one that predates Phase 14
+                # (and every in-test double) keeps the original three writes.
+                with _transaction_for(self.storage):
+                    self.storage.insert_tool_run(tool_run)
+                    if self.ingest is not None:
+                        self.ingest(task, tool_run, artifacts, run, scope)
+                    self.storage.set_task_status(task.id, "completed")
+            except Exception as exc:  # noqa: BLE001 - ingestion must not wedge the run
+                # The transaction rolled back, so no ToolRun, no evidence and no
+                # partial graph were committed, and the task is still ``running``.
+                # Marking it failed keeps the failure visible and retryable
+                # ("no lost work") rather than silently completing it without facts.
+                log.warning(
+                    "task %s (%s) ingestion failed: %s", task.id, task.type, exc
+                )
+                self.storage.set_task_status(task.id, "failed")
+                executed = True
+                continue
             done.add(task.id)
             executed = True
         return executed

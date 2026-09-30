@@ -14,6 +14,7 @@ rows back to the committed dataclass entities the contract is written in.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from decimal import Decimal
 from typing import Any, Iterable, Mapping, Optional
 from uuid import UUID
@@ -21,6 +22,21 @@ from uuid import UUID
 import psycopg
 
 from core.orchestrator import Storage, _RUN_TERMINAL, _TASK_STARTED, _TASK_TERMINAL
+from recon.ingest import (
+    ENTITY_ARTIFACT_CAP,
+    ENTITY_ASSET,
+    ENTITY_ASSET_IP,
+    ENTITY_ASSET_TECHNOLOGY,
+    ENTITY_DNS_RECORD,
+    ENTITY_IP,
+    ENTITY_OBSERVED_HOST,
+    ENTITY_OBSERVED_IP,
+    ENTITY_OBSERVED_WEB_APP,
+    ENTITY_PORT,
+    ENTITY_TECHNOLOGY,
+    ENTITY_WEB_APP,
+    KIND_IP,
+)
 from database.models.entities import (
     Asset,
     AssetIp,
@@ -293,6 +309,26 @@ class AssetIpRepository(BaseRepository):
         )
         return cur.fetchone()
 
+    def list_for_asset(self, asset_id) -> list[dict]:
+        """IPs already known for an asset.
+
+        Phase 14 needs this because ``web_apps.port_id`` is NOT NULL and an
+        ``ips`` row must exist before a port can be created: a web observation is
+        only rooted when the asset already has a known IP. Ingestion never
+        resolves a host itself to manufacture one.
+        """
+        return self._fetch_all(
+            "SELECT * FROM asset_ips WHERE asset_id = %s ORDER BY observed_at",
+            (asset_id,),
+        )
+
+    def ip_id_for_asset(self, asset_id) -> Optional[UUID]:
+        row = self._fetch_one(
+            "SELECT ip_id FROM asset_ips WHERE asset_id = %s ORDER BY observed_at LIMIT 1",
+            (asset_id,),
+        )
+        return row["ip_id"] if row else None
+
 
 class DnsRecordRepository(BaseRepository):
     def insert(self, record: DnsRecord) -> dict:
@@ -456,6 +492,49 @@ class EvidenceRepository(BaseRepository):
         )
 
 
+class TechnologyRepository(BaseRepository):
+    """Canonical ``technologies`` table access (Phase 14).
+
+    ``technologies`` is global and program-independent; the per-program association
+    lives in ``asset_technologies``. ``category`` is constrained by a CHECK and
+    the adapters report no category, so callers pass the value they can actually
+    justify (``recon.ingest.DEFAULT_TECHNOLOGY_CATEGORY``) rather than guessing.
+    """
+
+    def upsert(self, name: str, category: str) -> dict:
+        cur = self.conn.execute(
+            "INSERT INTO technologies (name, category) VALUES (%s, %s) "
+            "ON CONFLICT (name) DO UPDATE SET category = EXCLUDED.category "
+            "RETURNING *",
+            (name, category),
+        )
+        return cur.fetchone()
+
+
+class AssetTechnologyRepository(BaseRepository):
+    """Canonical ``asset_technologies`` table access (Phase 14).
+
+    This is the one association table that carries ``evidence_id`` inline (a
+    nullable ``REFERENCES evidence (id)``), so the asset->technology link keeps
+    its provenance without a second provenance column.
+    """
+
+    def upsert(
+        self, asset_id, technology_id, confidence: float, evidence_id=None
+    ) -> dict:
+        cur = self.conn.execute(
+            "INSERT INTO asset_technologies "
+            "(asset_id, technology_id, confidence, evidence_id) "
+            "VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (asset_id, technology_id) "
+            "DO UPDATE SET confidence = EXCLUDED.confidence, "
+            "evidence_id = EXCLUDED.evidence_id "
+            "RETURNING *",
+            (asset_id, technology_id, confidence, evidence_id),
+        )
+        return cur.fetchone()
+
+
 class HypothesisRepository(BaseRepository):
     """Canonical ``hypotheses`` table access (05_DATA_MODEL.md).
 
@@ -540,6 +619,8 @@ class Repositories(Storage):
         self.tasks = TaskRepository(conn)
         self.tool_runs = ToolRunRepository(conn)
         self.evidence = EvidenceRepository(conn)
+        self.technologies = TechnologyRepository(conn)
+        self.asset_technologies = AssetTechnologyRepository(conn)
         self.hypotheses = HypothesisRepository(conn)
 
     # -- core.orchestrator.Storage contract ----------------------------------
@@ -589,6 +670,161 @@ class Repositories(Storage):
         self, tool_run_id: UUID, exit_code: int, raw_output_ref: Optional[str]
     ) -> None:
         self.tool_runs.finalize(tool_run_id, exit_code, raw_output_ref)
+
+    # -- Phase 14: transactional evidence ingestion ---------------------------
+    #
+    # These are additive to the contract above: Phase 13 paths keep working
+    # unchanged, and the orchestrator only uses them when the concrete storage
+    # actually provides them (duck-typed, like ``set_run_progress``).
+
+    @contextmanager
+    def transaction(self):
+        """Group several repository calls into one atomic unit (Phase 14).
+
+        The connection is opened with ``autocommit=True`` so every repository
+        operation is otherwise its own unit of work
+        (``database/repositories/base.py``). psycopg's ``transaction()`` opens a
+        real BEGIN/COMMIT around the block regardless of that autocommit default,
+        so the default behaviour of every existing caller is unchanged and only
+        this path opts into atomicity.
+        """
+        with self.conn.transaction():
+            yield self
+
+    def ingest_observations(
+        self,
+        plan,
+        *,
+        tool_run_id: UUID,
+        raw_output_ref: Optional[str],
+        program_id: UUID,
+    ) -> None:
+        """Persist a scope-checked :class:`recon.ingest.IngestionPlan`.
+
+        Call inside :meth:`transaction` so the ToolRun, this evidence, these graph
+        rows and the task's terminal state commit or roll back together. Canonical
+        identity comes from the existing UNIQUE indexes and is never the evidence
+        id, so repeating an execution converges on the same entities while this
+        run's evidence is appended as provenance history.
+        """
+        if plan is None:
+            return
+
+        def _evidence(entity_type: str, entity_id=None) -> UUID:
+            row = self.evidence.insert(
+                Evidence(
+                    tool_run_id=tool_run_id,
+                    entity_type=entity_type,
+                    entity_id=entity_id,
+                    raw_reference=raw_output_ref,
+                )
+            )
+            return row["id"]
+
+        asset_ids: dict[str, UUID] = {}
+        for asset in plan.assets:
+            row = self.assets.upsert(
+                Asset(
+                    program_id=program_id,
+                    hostname=asset.hostname,
+                    source=asset.source,
+                )
+            )
+            _evidence(ENTITY_ASSET, row["id"])
+            asset_ids[asset.hostname] = row["id"]
+
+        # ``dns_records`` has no UNIQUE index, so the documented idempotency rule
+        # is applied here against the existing read rather than by migrating.
+        dns_seen: dict[UUID, set] = {}
+        for record in plan.dns_records:
+            asset_id = asset_ids.get(record.hostname)
+            if asset_id is None:
+                continue
+            if asset_id not in dns_seen:
+                dns_seen[asset_id] = {
+                    (row["record_type"], row["value"])
+                    for row in self.dns_records.list_for_asset(asset_id)
+                }
+            key = (record.record_type, record.value)
+            if key in dns_seen[asset_id]:
+                continue
+            dns_seen[asset_id].add(key)
+            row = self.dns_records.insert(
+                DnsRecord(
+                    asset_id=asset_id,
+                    record_type=record.record_type,
+                    value=record.value,
+                )
+            )
+            _evidence(ENTITY_DNS_RECORD, row["id"])
+
+        for link in plan.ip_links:
+            asset_id = asset_ids.get(link.hostname)
+            if asset_id is None:
+                continue
+            ip = self.ips.upsert(link.address)
+            self.asset_ips.upsert(asset_id, ip["id"])
+            _evidence(ENTITY_IP, ip["id"])
+            # ``asset_ips`` has a composite primary key and no ``evidence_id``, so
+            # the edge's provenance is a polymorphic row with a NULL entity_id.
+            _evidence(ENTITY_ASSET_IP)
+
+        for web in plan.web_apps:
+            asset_id = asset_ids.get(web.hostname)
+            if asset_id is None:
+                continue
+            ip_id = self.asset_ips.ip_id_for_asset(asset_id)
+            if ip_id is None:
+                # Unrootable: ``web_apps.port_id`` is NOT NULL and the observation
+                # carries no IP. Preserved as evidence, never fabricated.
+                _evidence(ENTITY_OBSERVED_WEB_APP)
+                continue
+            port = self.ports.upsert(
+                Port(
+                    ip_id=ip_id,
+                    port_number=web.port,
+                    protocol="tcp",
+                    state="open",
+                )
+            )
+            _evidence(ENTITY_PORT, port["id"])
+            app = self.web_apps.upsert(
+                WebApp(
+                    asset_id=asset_id,
+                    port_id=port["id"],
+                    status_code=web.status_code,
+                    title=web.title,
+                    server_header=web.server_header,
+                )
+            )
+            _evidence(ENTITY_WEB_APP, app["id"])
+
+        for link in plan.technologies:
+            asset_id = asset_ids.get(link.hostname)
+            if asset_id is None:
+                continue
+            technology = self.technologies.upsert(link.name, link.category)
+            _evidence(ENTITY_TECHNOLOGY, technology["id"])
+            # asset_technologies is the one association carrying ``evidence_id``
+            # inline; its composite PK means entity_id stays NULL.
+            self.asset_technologies.upsert(
+                asset_id,
+                technology["id"],
+                link.confidence,
+                _evidence(ENTITY_ASSET_TECHNOLOGY),
+            )
+
+        for observation in plan.out_of_scope:
+            # Preserved, never promoted. The evidence table has no reason column,
+            # so the scope-denial reason is logged by the caller, not stored.
+            _evidence(
+                ENTITY_OBSERVED_IP
+                if observation.kind == KIND_IP
+                else ENTITY_OBSERVED_HOST
+            )
+
+        if plan.truncated:
+            _evidence(ENTITY_ARTIFACT_CAP)
 
     def insert_hypothesis(self, hypothesis: Hypothesis) -> Hypothesis:
         return _hypothesis_from_row(self.hypotheses.insert(hypothesis))

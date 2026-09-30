@@ -33,6 +33,7 @@ returning a ``FastAPI`` instance); it constructs the whole injection graph so
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -41,14 +42,18 @@ from typing import Callable, Mapping, Optional
 from api.server import create_app
 from core.config import Config, ConfigError, DatabaseConfig, ScopeConfig
 from core.memory_storage import MemoryStorage
-from core.orchestrator import Orchestrator
+from core.orchestrator import Orchestrator, ToolRunOutcome
 from core.rate_limiter import RateLimiter
-from core.scope_guard import ScopeGuard, ScopeRule, ScopeRuleType
+from core.scope_guard import ScopeGuard, ScopeRule, ScopeRuleType, extract_host
 from core.tool_runner import ToolRunner, ToolRunnerError
 from database.models.entities import ToolRun
 from recon.base import ToolAdapter
 from recon.dns.resolver import DnsResolverAdapter, make_resolver
+from recon.ingest import plan_ingestion
+from recon.normalize import normalize_hostname
 from recon.web.httpx_probe import HttpxProbeAdapter
+
+log = logging.getLogger(__name__)
 
 #: Environment variable holding the PostgreSQL URL for the served runtime. Same
 #: variable name ``core.config.DatabaseConfig`` already reads.
@@ -179,7 +184,15 @@ class ServedExecution:
             # conservative default rather than an opened-up policy.
             return None
 
-    def __call__(self, task, scope=None, config=None) -> ToolRun:
+    def run(self, task, scope=None, config=None) -> ToolRunOutcome:
+        """Execute ``task`` and return its ``ToolRun`` **with** its parsed artifacts.
+
+        Phase 14: ``__call__`` historically returned only the ``ToolRun``, silently
+        discarding the normalized observations the adapter had just produced. The
+        served wiring points the orchestrator's ``run_tool`` seam here so those
+        artifacts reach ingestion; ``__call__`` is kept returning a bare
+        ``ToolRun`` for every existing caller and test.
+        """
         adapter = self.adapter_for(task)
         execution = adapter.execute(
             task,
@@ -189,13 +202,19 @@ class ServedExecution:
             # closed rather than resolving something nobody authorized.
             scope=scope if scope is not None else ScopeGuard.from_config(ScopeConfig()),
         )
-        return ToolRun(
-            task_id=task.id,
-            tool_name=execution.tool,
-            command=list(execution.command),
-            exit_code=execution.exit_code,
-            raw_output_ref=execution.raw_output_ref,
+        return ToolRunOutcome(
+            tool_run=ToolRun(
+                task_id=task.id,
+                tool_name=execution.tool,
+                command=list(execution.command),
+                exit_code=execution.exit_code,
+                raw_output_ref=execution.raw_output_ref,
+            ),
+            artifacts=tuple(execution.artifacts),
         )
+
+    def __call__(self, task, scope=None, config=None) -> ToolRun:
+        return self.run(task, scope=scope, config=config).tool_run
 
 
 #: Inject the DNS resolution outcome into an ``Orchestrator.run_tool`` seam.
@@ -298,6 +317,70 @@ def _default_adapters(
     return adapters
 
 
+#: Phase 14: the storage method that applies a scope-checked ingestion plan.
+_INGEST_METHOD = "ingest_observations"
+
+
+def _build_ingestor(store, config: Config) -> Optional[Callable[..., None]]:
+    """Build the Phase-14 ingestion callback for a served orchestrator.
+
+    Returns ``None`` when the storage cannot persist facts (e.g. ``MemoryStorage``),
+    so the orchestrator keeps its exact pre-Phase-14 behaviour instead of calling a
+    method that does not exist. The returned callable runs *inside* the
+    orchestrator's transaction, so everything it writes commits or rolls back
+    together with the ``ToolRun`` and the task's terminal state.
+    """
+    if not callable(getattr(store, _INGEST_METHOD, None)):
+        return None
+
+    limit = config.limits.max_artifacts_per_run
+    # An absent guard denies everything: with no authoritative guard no observed
+    # destination can be classified, and promoting an unclassified one would reopen
+    # the Phase 13 boundary. Everything is then recorded as an observation instead.
+    deny_all = ScopeGuard.from_config(ScopeConfig())
+
+    def ingest(task, tool_run: ToolRun, artifacts, run, scope) -> None:
+        if not artifacts:
+            return
+        plan = plan_ingestion(
+            artifacts,
+            scope=scope if scope is not None else deny_all,
+            source=tool_run.tool_name,
+            target_host=normalize_hostname(extract_host(task.target)),
+            max_artifacts=limit,
+        )
+        for observation in plan.out_of_scope:
+            # ``evidence`` has no reason column, so the scope denial is logged here
+            # while the observation itself is preserved (without a graph row).
+            log.info(
+                "out-of-scope %s %r not promoted: %s",
+                observation.kind,
+                observation.value,
+                observation.reason,
+            )
+        if plan.truncated:
+            log.warning(
+                "tool %s exceeded limits.max_artifacts_per_run=%d; %d artifact(s) dropped",
+                tool_run.tool_name,
+                limit,
+                plan.truncated,
+            )
+        if plan.unrecognized:
+            log.warning(
+                "tool %s produced %d unrecognized artifact(s); no records created",
+                tool_run.tool_name,
+                plan.unrecognized,
+            )
+        getattr(store, _INGEST_METHOD)(
+            plan,
+            tool_run_id=tool_run.id,
+            raw_output_ref=tool_run.raw_output_ref,
+            program_id=run.program_id,
+        )
+
+    return ingest
+
+
 def create_serve_app(
     *,
     api_key: Optional[str] = None,
@@ -368,10 +451,16 @@ def create_serve_app(
     # fail closed with no possible cause. The orchestrator still enforces scope
     # itself, before the tool is reached. ``config=`` likewise carries the run's own
     # persisted configuration into the adapter.
+    # Phase 14: run_tool points at ``ServedExecution.run`` so the adapter's parsed
+    # artifacts reach ingestion instead of being discarded. ``ingest`` maps and
+    # persists them inside the orchestrator's transaction. Both are additive: a
+    # run with no artifacts ingests nothing, and every other caller of
+    # ``ServedExecution`` still gets a bare ``ToolRun`` from ``__call__``.
     orch = Orchestrator(
         storage=store,
-        run_tool=execution,
+        run_tool=execution.run,
         rate_limiter=limiter,
+        ingest=_build_ingestor(store, effective_config),
     )
 
     app = create_app(orch, api_key=effective_key)

@@ -245,15 +245,26 @@ class AiConfig:
 class LimitsConfig:
     requests_per_second: float = 10.0
     concurrency: int = 5
+    # Phase 14: cap on the artifacts ingested from a *single* tool execution, so a
+    # hostile or runaway tool cannot turn one task into an unbounded graph write.
+    # Ingestion truncates at this bound and records that it did; it never fails the
+    # run merely because a tool produced too much (06_TOOL_CONTRACTS.md).
+    max_artifacts_per_run: int = 10000
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "LimitsConfig":
         data = data or {}
         rps = data.get("requests_per_second", 10.0)
         concurrency = data.get("concurrency", 5)
+        max_artifacts = data.get("max_artifacts_per_run", 10000)
         _require_positive(rps, "limits.requests_per_second")
         _require_positive(concurrency, "limits.concurrency")
-        return cls(requests_per_second=float(rps), concurrency=int(concurrency))
+        _require_positive(max_artifacts, "limits.max_artifacts_per_run")
+        return cls(
+            requests_per_second=float(rps),
+            concurrency=int(concurrency),
+            max_artifacts_per_run=int(max_artifacts),
+        )
 
 
 @dataclass(frozen=True)
@@ -371,6 +382,7 @@ class Config:
             "limits": {
                 "requests_per_second": self.limits.requests_per_second,
                 "concurrency": self.limits.concurrency,
+                "max_artifacts_per_run": self.limits.max_artifacts_per_run,
             },
             "outputs": {
                 "json": self.outputs.json,

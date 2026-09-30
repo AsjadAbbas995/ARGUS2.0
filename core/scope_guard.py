@@ -100,7 +100,11 @@ class ScopeGuard:
                     rule_type=(
                         ScopeRuleType.IP if single else ScopeRuleType.CIDR
                     ),
-                    value=str(entry if single else network),
+                    # For a single address the rule is matched by exact equality in
+                    # ``check_ip``, so the value must be the bare address. Keeping the
+                    # entry verbatim would store "1.2.3.4/32" for an IP rule, which no
+                    # address can ever equal, silently authorizing nothing.
+                    value=str(network.network_address if single else network),
                     allowed=True,
                 )
             )
@@ -138,7 +142,7 @@ class ScopeGuard:
 
     def check_host(self, hostname: str) -> ScopeDecision:
         host = normalize_host(hostname)
-        if not host:
+        if not host or not _is_valid_hostname(host):
             return ScopeDecision(
                 in_scope=False, reason=f"invalid hostname {hostname!r}"
             )
@@ -297,6 +301,31 @@ def _is_single_ip(value: str) -> bool:
         return isinstance(ip, (ipaddress.IPv4Address, ipaddress.IPv6Address))
     except ValueError:
         return False
+
+
+def _is_valid_hostname(host: str) -> bool:
+    """True when ``host`` could actually be a DNS name.
+
+    Scope rules match by suffix, so without a syntax check any string ending in
+    an allowed domain is treated as in scope -- including strings that no resolver
+    can ever answer for, such as ``evil'; DROP TABLE assets; --.example.com``.
+    Those are not hostnames; they are malformed input, and promoting one to an
+    asset would persist attacker-chosen bytes into the asset graph.
+
+    Underscores are deliberately permitted: real reconnaissance output contains
+    service names such as ``_dmarc.example.com`` and ``_sip._tcp.example.com``.
+    Punycode (``xn--``) labels are valid ASCII and pass unchanged. This checks only
+    that the name is *possible*; it makes no claim that it resolves.
+    """
+    if not host or len(host) > 253:
+        return False
+    if host.startswith("."):
+        return False
+    allowed = set("abcdefghijklmnopqrstuvwxyz0123456789-_.")
+    if not set(host) <= allowed:
+        return False
+    labels = host.split(".")
+    return all(0 < len(label) <= 63 for label in labels)
 
 
 def _host_matches(host: str, rule_value: str) -> bool:
