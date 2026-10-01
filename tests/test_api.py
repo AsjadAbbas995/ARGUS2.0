@@ -75,6 +75,12 @@ class _RecordingOrchestrator:
     def list_tasks(self, run_id: UUID):
         return self.tasks.get(str(run_id), [])
 
+    def list_hypotheses(self, run_id: UUID) -> list:
+        # Part of the orchestrator seam ``create_app`` documents that it depends on.
+        # This double records no hypotheses, so an empty list is the accurate answer --
+        # it must not be absent, or the served report would fail on a missing method.
+        return []
+
     def set_task_status(self, run_id: UUID) -> None:
         raise AssertionError("Phase-10 API must not write task state directly")
 

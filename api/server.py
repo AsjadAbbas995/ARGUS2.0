@@ -14,6 +14,14 @@ The orchestrator seam the app depends on is exactly: ``create_run(run: Run)``, `
 ``reject_hypothesis``.
 The liveness probe is deliberately unauthenticated; every other route requires a Bearer API
 key compared in constant time against ``app.state.argus_api_key``.
+
+Phase 15 adds ``GET /api/v1/runs/{run_id}/attack-surface`` and feeds the served report from
+real persisted facts. Both read through the orchestrator's ``storage`` attribute -- the same
+seam every other route already uses -- so no route instantiates a repository, executes a tool,
+adapter or subprocess, or opens its own database connection. The attack surface is rebuilt from
+the run's evidence on each request rather than cached, so it cannot go stale relative to the
+database it describes. Every storage read here is optional and duck-typed, so a backend that
+predates Phase 15 degrades to an honest empty section instead of raising.
 """
 
 from __future__ import annotations
@@ -29,6 +37,7 @@ from pathlib import Path as _ArgusRoot
 from core.config import ConfigError, ScopeConfig, run_snapshot_from_dict
 from core.orchestrator import BadRunTransition, Orchestrator, RunNotFoundError
 from core.scope_guard import ScopeGuard, ScopeRuleType
+from database import projection
 from database.models.entities import Run, Task
 from reports import html_report, json_report, markdown_report
 
@@ -44,6 +53,67 @@ _SCOPE_ALLOW_IPS = (ScopeRuleType.IP, ScopeRuleType.CIDR)
 
 _LIVENESS = "/_healthz"
 _BEARER_PREFIX = "bearer "
+
+#: The only ``truth_label`` that may appear in a report's ``validated_findings``
+#: section. ``core.orchestrator.Orchestrator.approve_hypothesis`` is the single
+#: writer that sets it, and it only does so through explicit operator approval, so
+#: reading this one field is what keeps the facts/hypotheses/findings separation
+#: truthful in the served report instead of decorative.
+_VALIDATED_TRUTH_LABEL = "VALIDATED_FINDING"
+
+
+def _read_from_storage(orchestrator: Orchestrator, name: str, *args) -> list:
+    """Call an optional read on the orchestrator's storage, or return ``[]``.
+
+    Duck-typed on purpose and in the same spirit as ``_has_program_scope_rules``: a
+    storage backend that predates Phase 15 (the in-memory development double, a
+    recording double) simply does not have the read, and an absent read must degrade to
+    an honest empty section rather than raise. Production ``Repositories`` provides every
+    name probed here.
+    """
+    storage = getattr(orchestrator, "storage", None)
+    reader = getattr(storage, name, None)
+    if not callable(reader):
+        return []
+    return list(reader(*args))
+
+
+def _attack_surface(orchestrator: Orchestrator, run_id: UUID) -> dict:
+    """The run's Phase 15 attack surface, read-only.
+
+    Delegates to ``Repositories.attack_surface``, which owns the run-scoped SQL and the
+    projection. A storage backend with no canonical fact store returns
+    ``available: false`` instead of an empty-but-present graph, so a consumer can tell
+    "nothing was projected because there is nothing to project from" apart from "this run
+    observed nothing".
+    """
+    storage = getattr(orchestrator, "storage", None)
+    provider = getattr(storage, "attack_surface", None)
+    if not callable(provider):
+        return projection.unavailable(run_id)
+    surface = provider(run_id)
+    # ``None`` means the run id is unknown. Callers resolve the run first and 404, so
+    # this is only a guard against a storage that disagrees with ``get_run``.
+    return projection.unavailable(run_id) if surface is None else surface
+
+
+def _asset_counts(surface: Mapping[str, object]) -> dict[str, int]:
+    """Canonical entity counts for the report's ``assets`` section.
+
+    Only the canonical entity types are counted. The attack surface also counts the
+    observation-only evidence tags (out-of-scope hosts/IPs, the artifact cap); those are
+    not assets, and folding them into an "assets" count would overstate what was found.
+    Denied observations stay visible in the ``evidence`` section, which is where they
+    belong.
+    """
+    counts = surface.get("evidence_counts")
+    if not isinstance(counts, Mapping):
+        return {}
+    return {
+        entity_type: int(counts[entity_type])
+        for entity_type in projection.CANONICAL_ENTITY_TYPES
+        if counts.get(entity_type)
+    }
 
 
 def _run_payload(run) -> Mapping[str, str]:
@@ -515,13 +585,54 @@ def create_app(orchestrator: Orchestrator, api_key: str) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc))
         return _run_state_payload(orchestrator, run_id)
 
+    @app.get("/api/v1/runs/{run_id}/attack-surface", dependencies=[Depends(_authed)])
+    def get_attack_surface(run_id: UUID) -> JSONResponse:
+        """The run's projected attack surface: records, graph, and inferences.
+
+        Read-only. This handler performs no writes, creates no task, runs no tool, makes
+        no network call and evaluates no scope: it delegates to the orchestrator's storage
+        read, which resolves the run's persisted evidence and runs the committed
+        correlation graph and inference engine over it. Every node and edge carries the
+        evidence id that justifies it, and inferences are returned with their own
+        ``truth_label`` -- this route asserts nothing on the target's behalf.
+        """
+        _require_run(orchestrator, run_id)
+        return JSONResponse(_attack_surface(orchestrator, run_id))
+
     @app.get("/api/v1/runs/{run_id}/reports/{fmt}", dependencies=[Depends(_authed)])
     def get_report(run_id: UUID, fmt: str):
         run = orchestrator.get_run(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="run not found")
-        tasks = orchestrator.list_tasks(run_id)
-        report = json_report.build_report(run=run, tasks=tasks)
+        # Phase 15: the report is built from the run's *actual* persisted facts.
+        # Previously only ``run`` and ``tasks`` were supplied, so every tool run,
+        # asset count, evidence row and hypothesis section rendered empty even though
+        # Phase 14 had persisted all of them, and the report read as a run that had
+        # observed nothing.
+        surface = _attack_surface(orchestrator, run_id)
+        tool_runs = _read_from_storage(orchestrator, "list_tool_runs", run_id)
+        evidence = _read_from_storage(orchestrator, "list_evidence", run_id)
+        reviewed = [
+            _hypothesis_payload(h)
+            for h in (orchestrator.list_hypotheses(run_id) or [])
+        ]
+        report = json_report.build_report(
+            run=run,
+            tasks=orchestrator.list_tasks(run_id),
+            tool_runs=tool_runs,
+            asset_counts=_asset_counts(surface),
+            evidence_count=len(evidence),
+            # Split on the stored truth label: only operator approval sets
+            # VALIDATED_FINDING, so nothing is promoted by being merely derived.
+            hypotheses=[
+                h for h in reviewed if str(h.get("truth_label", "")) != _VALIDATED_TRUTH_LABEL
+            ],
+            validated_findings=[
+                h for h in reviewed if str(h.get("truth_label", "")) == _VALIDATED_TRUTH_LABEL
+            ],
+            evidence=evidence,
+            attack_surface=surface,
+        )
         if fmt == "json":
             return PlainTextResponse(json_report.render(report), media_type="application/json")
         if fmt == "markdown":

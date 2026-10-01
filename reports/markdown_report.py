@@ -3,8 +3,8 @@
 Projects the **same** underlying report dict that ``reports.json_report.build_report`` builds
 (so JSON / Markdown / HTML all render one data object) and keeps the truth-label contract:
 
-- Facts (run metadata, assets, task surface, tool runs, dedup) are rendered from their own
-  committed sections.
+- Facts (run metadata, assets, task surface, tool runs, dedup, and the Phase 15 projected
+  attack-surface graph) are rendered from their own committed sections.
 - Hypotheses stay in a clearly labelled ``# Hypotheses`` section; each item carries its stored
   ``truth_label`` and ``confidence`` - never re-ranked, never merged with validated findings.
 - Validated findings and the evidence chain are separate, labelled sections.
@@ -29,6 +29,7 @@ _TOOL_RUNS = "tool_runs"
 _DEDUP = "dedup"
 _ASSETS = "assets"
 _RUN = "run"
+_ATTACK_SURFACE = "attack_surface"
 
 _LABELS = {"HYPOTHESIS", "UNVERIFIED_CLAIM", "VALIDATED_FINDING"}
 
@@ -63,7 +64,77 @@ def _facts_section(report: Mapping[str, Any]) -> str:
     if isinstance(dedup, Mapping) and dedup:
         out.append("\n## Deduplication\n")
         out.append(f"- suppressed_completed_fingerprints: {dedup.get('suppressed_completed_fingerprints', 0)}")
+    out.append(_attack_surface_block(report))
     return "".join(out) + _DIVIDER
+
+
+def _attack_surface_block(report: Mapping[str, Any]) -> str:
+    """Render the Phase 15 projected graph, or nothing when it was not supplied.
+
+    A ``*``-level subsection of Facts rather than a new top-level section, because the
+    graph is a *descriptive projection of recorded facts*: every node and edge already
+    carries its evidence id, so it belongs beside the other facts and must never read as
+    an assertion. Inferences are printed with their own ``truth_label`` and are explicitly
+    not findings.
+    """
+    surface = report.get(_ATTACK_SURFACE)
+    if not isinstance(surface, Mapping):
+        return ""
+    out: list[str] = ["\n## Attack Surface\n"]
+    if not surface.get("available", False):
+        out.append(
+            "_No canonical fact store available for this run "
+            "(no attack surface was projected)._"
+        )
+        return "".join(out)
+
+    records = surface.get("records")
+    if isinstance(records, Mapping):
+        out.append(f"- records: {int(records.get('count', 0))}")
+        by_kind = records.get("by_kind")
+        if isinstance(by_kind, Mapping) and by_kind:
+            rendered = ", ".join(
+                f"{name}={int(count)}" for name, count in sorted(by_kind.items())
+            )
+            out.append(f"- record kinds: {rendered}")
+    graph = surface.get("graph")
+    if isinstance(graph, Mapping):
+        out.append(
+            f"- graph: nodes={int(graph.get('node_count', 0))} "
+            f"edges={int(graph.get('edge_count', 0))} "
+            f"orphans={int(graph.get('orphan_count', 0))}"
+        )
+        orphans = graph.get("orphans")
+        if isinstance(orphans, list) and orphans:
+            out.append(f"- unlinked nodes: {', '.join(str(o) for o in orphans)}")
+    endpoints = surface.get("endpoint_subgraph")
+    if isinstance(endpoints, Mapping):
+        out.append(
+            f"- endpoint subgraph: {int(endpoints.get('node_count', 0))} node(s), "
+            f"{int(endpoints.get('edge_count', 0))} edge(s)"
+        )
+    inferences = surface.get("inferences")
+    if isinstance(inferences, Mapping):
+        count = int(inferences.get("count", 0))
+        out.append(f"- inferences: {count} (hypotheses, not findings)")
+        items = inferences.get("items")
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, Mapping):
+                    continue
+                truth = str(item.get("truth_label", "UNVERIFIED_CLAIM"))
+                if truth not in _LABELS:
+                    truth = "UNVERIFIED_CLAIM"
+                ids = ", ".join(str(e) for e in item.get("evidence_ids") or [])
+                out.append(f"  - **{truth}** - {str(item.get('statement', ''))}")
+                if ids:
+                    out.append(f"    evidence=[{ids}]")
+    unproduced = surface.get("unproduced_record_kinds")
+    if isinstance(unproduced, list) and unproduced:
+        out.append(
+            f"- no producer yet (not projected): {', '.join(str(k) for k in unproduced)}"
+        )
+    return "".join(out)
 
 
 def _nested_section(out: list[str], heading: str, section: Any) -> None:

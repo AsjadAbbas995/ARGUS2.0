@@ -18,6 +18,7 @@ from database.models.entities import Asset, Evidence, Run, Task, ToolRun
 _HYPOTHESES_SECTION = "hypotheses"
 _FINDINGS_SECTION = "validated_findings"
 _EVIDENCE_SECTION = "evidence"
+_ATTACK_SURFACE_SECTION = "attack_surface"
 
 _PRIORITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "none": 4}
 
@@ -54,6 +55,7 @@ def build_report(
     hypotheses: Iterable[Mapping[str, Any]] = (),
     validated_findings: Iterable[Mapping[str, Any]] = (),
     evidence: Iterable[Evidence] = (),
+    attack_surface: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     """Build the full report dict for ``run``.
 
@@ -61,6 +63,17 @@ def build_report(
     ``core.json_summary.build_json_summary`` (facts), and the hypothesis / validated-finding /
     evidence sections are appended in stable order. Facts and hypotheses stay in *separate,
     correctly labelled* sections; a hypothesis is never promoted into ``validated_findings``.
+
+    ``attack_surface`` is the Phase 15 projected graph (``database.projection.serialize``),
+    passed in already-serialised so this module keeps no dependency on ``correlation``. It is
+    optional and defaults to ``None``, which omits the key entirely rather than emitting an
+    empty graph: a caller that has no canonical store (e.g. the in-memory double) must not be
+    reported as a run with no attack surface, and every existing caller keeps its exact
+    previous output.
+
+    The section carries its own ``truth_label`` on each inference and is deliberately *not*
+    merged into ``validated_findings``. An inference is a hypothesis; only the review
+    workflow in ``validated_findings`` can promote one.
     """
     base = build_json_summary(
         run,
@@ -72,12 +85,15 @@ def build_report(
     hyp_list = sorted(hypotheses, key=_hypothesis_key)
     finding_list = sorted(validated_findings, key=_hypothesis_key)
     ev_list = sorted(evidence, key=_evidence_key)
-    return {
+    report = {
         **base,
         _HYPOTHESES_SECTION: [_normalise(h) for h in hyp_list],
         _FINDINGS_SECTION: [_normalise(f) for f in finding_list],
         _EVIDENCE_SECTION: [_evidence_summary(e) for e in ev_list],
     }
+    if attack_surface is not None:
+        report[_ATTACK_SURFACE_SECTION] = dict(attack_surface)
+    return report
 
 
 def _normalise(h: Mapping[str, Any]) -> dict[str, Any]:

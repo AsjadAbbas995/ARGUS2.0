@@ -15,13 +15,15 @@ rows back to the committed dataclass entities the contract is written in.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 from decimal import Decimal
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional, Sequence
 from uuid import UUID
 
 import psycopg
 
 from core.orchestrator import Storage, _RUN_TERMINAL, _TASK_STARTED, _TASK_TERMINAL
+from database.projection import RunFacts, project, serialize
 from recon.ingest import (
     ENTITY_ARTIFACT_CAP,
     ENTITY_ASSET,
@@ -117,6 +119,18 @@ def _tool_run_from_row(row: Optional[Mapping[str, Any]]) -> Optional[ToolRun]:
         raw_output_ref=row["raw_output_ref"],
         started_at=row["started_at"],
         completed_at=row["completed_at"],
+    )
+
+
+def _evidence_from_row(row: Optional[Mapping[str, Any]]) -> Optional[Evidence]:
+    if row is None:
+        return None
+    return Evidence(
+        id=row["id"],
+        tool_run_id=row["tool_run_id"],
+        entity_type=row["entity_type"],
+        entity_id=row["entity_id"],
+        raw_reference=row["raw_reference"],
     )
 
 
@@ -288,6 +302,21 @@ class AssetRepository(BaseRepository):
             "SELECT * FROM assets WHERE hostname = %s", (hostname,)
         )
 
+    def list_by_ids(self, asset_ids: Sequence[UUID]) -> list[dict]:
+        """Assets by primary key, for a caller that already resolved the ids.
+
+        The caller supplies ids it legitimately owns (Phase 15 derives them from this
+        run's own evidence rows), so this read is deliberately a primary-key lookup and
+        not a second authorization decision. ``hostname`` is returned with an explicit
+        collation-free ordering so the caller's transformation stays deterministic.
+        """
+        if not asset_ids:
+            return []
+        return self._fetch_all(
+            "SELECT * FROM assets WHERE id = ANY(%s::uuid[]) ORDER BY hostname, id",
+            (list(asset_ids),),
+        )
+
 
 class IpRepository(BaseRepository):
     def upsert(self, address: str) -> dict:
@@ -298,6 +327,29 @@ class IpRepository(BaseRepository):
             (address,),
         )
         return cur.fetchone()
+
+    def list_by_ids(self, ip_ids: Sequence[UUID]) -> list[dict]:
+        """IPs by primary key, with ``address`` as the bare host address.
+
+        ``host()`` rather than the ``address::text`` used by :meth:`upsert`, and the
+        difference is deliberate. ``ips.address`` is ``inet``, so ``::text`` renders the
+        prefix length too (``93.184.216.34/32``) -- PostgreSQL's canonical form, which is
+        what the write path returns and what ``tests/test_database_live.py`` pins.
+
+        This read feeds the correlation layer, where the same string becomes a graph node
+        *key* and an ``IpRecord.address``/``PortRecord.ip`` value. Phase 14 was handed a
+        bare address (``IpObservation.address``), and ``93.184.216.34/32:443`` is not the
+        port key any other projection of that observation produces. Spelling the address
+        the way it was observed is what keeps the Postgres-backed graph identical to the
+        in-memory one.
+        """
+        if not ip_ids:
+            return []
+        return self._fetch_all(
+            "SELECT id, host(address) AS address, first_seen FROM ips "
+            "WHERE id = ANY(%s::uuid[]) ORDER BY address, id",
+            (list(ip_ids),),
+        )
 
 
 class AssetIpRepository(BaseRepository):
@@ -328,6 +380,23 @@ class AssetIpRepository(BaseRepository):
             (asset_id,),
         )
         return row["ip_id"] if row else None
+
+    def list_for_assets(self, asset_ids: Sequence[UUID]) -> list[dict]:
+        """Host -> IP bindings for a set of assets.
+
+        Read-only support for the Phase 15 projection. Run attribution for this edge is
+        resolved by the caller through endpoint containment (both endpoints evidenced in
+        the same run), never from ``observed_at``: ``asset_ips`` has no ``evidence_id``
+        column and its composite primary key gives no single row id to cite, so its own
+        timestamps say nothing about *which run* created the binding.
+        """
+        if not asset_ids:
+            return []
+        return self._fetch_all(
+            "SELECT asset_id, ip_id FROM asset_ips "
+            "WHERE asset_id = ANY(%s::uuid[]) ORDER BY asset_id, ip_id",
+            (list(asset_ids),),
+        )
 
 
 class DnsRecordRepository(BaseRepository):
@@ -376,6 +445,16 @@ class PortRepository(BaseRepository):
             (ip_id, port_number, protocol),
         )
 
+    def list_by_ids(self, port_ids: Sequence[UUID]) -> list[dict]:
+        """Ports by primary key (Phase 15 projection read)."""
+        if not port_ids:
+            return []
+        return self._fetch_all(
+            "SELECT * FROM ports WHERE id = ANY(%s::uuid[]) "
+            "ORDER BY port_number, ip_id, id",
+            (list(port_ids),),
+        )
+
 
 class WebAppRepository(BaseRepository):
     def upsert(self, app: WebApp) -> dict:
@@ -396,6 +475,15 @@ class WebAppRepository(BaseRepository):
             ),
         )
         return cur.fetchone()
+
+    def list_by_ids(self, web_app_ids: Sequence[UUID]) -> list[dict]:
+        """Web applications by primary key (Phase 15 projection read)."""
+        if not web_app_ids:
+            return []
+        return self._fetch_all(
+            "SELECT * FROM web_apps WHERE id = ANY(%s::uuid[]) ORDER BY id",
+            (list(web_app_ids),),
+        )
 
 
 class TaskRepository(BaseRepository):
@@ -478,6 +566,20 @@ class ToolRunRepository(BaseRepository):
         )
         return cur.fetchone()
 
+    def list_for_run(self, run_id: UUID) -> list[dict]:
+        """Tool runs belonging to a run, resolved through ``tasks.run_id``.
+
+        Read-only support for Phase 15's served report, which previously rendered an
+        always-empty tool-run section because nothing ever read this back. ``tool_runs``
+        has no ``run_id`` column of its own, so the join is the only way to scope it.
+        """
+        return self._fetch_all(
+            "SELECT tr.* FROM tool_runs tr "
+            "JOIN tasks t ON t.id = tr.task_id "
+            "WHERE t.run_id = %s ORDER BY tr.started_at, tr.id",
+            (run_id,),
+        )
+
 
 class EvidenceRepository(BaseRepository):
     def insert(self, evidence: Evidence) -> dict:
@@ -489,6 +591,46 @@ class EvidenceRepository(BaseRepository):
                 "entity_id": evidence.entity_id,
                 "raw_reference": evidence.raw_reference,
             },
+        )
+
+    def list_for_run(self, run_id: UUID) -> list[dict]:
+        """Every evidence row belonging to a run, in stable id order.
+
+        Scoped through the same documented chain the Phase 14 writer establishes::
+
+            evidence.tool_run_id -> tool_runs.task_id -> tasks.run_id
+
+        Rows with a NULL ``tool_run_id`` are excluded, as they must be: they are not
+        attributable to any run, so including them would silently widen the scope.
+        Ordering is by the evidence primary key rather than any timestamp, because
+        ``evidence`` has no timestamp column and ordering by insertion would not be
+        reproducible across reads.
+        """
+        return self._fetch_all(
+            "SELECT e.* FROM evidence e "
+            "JOIN tool_runs tr ON tr.id = e.tool_run_id "
+            "JOIN tasks t ON t.id = tr.task_id "
+            "WHERE t.run_id = %s ORDER BY e.id",
+            (run_id,),
+        )
+
+    def list_fact_refs_for_run(self, run_id: UUID) -> list[dict]:
+        """Run-scoped ``(evidence_id, entity_type, entity_id)`` triples for the projection.
+
+        The same run chain as :meth:`list_for_run`, narrowed to the three columns
+        ``database.projection.RunFacts.from_evidence_rows`` consumes and with the id
+        aliased to ``evidence_id``. Kept separate from :meth:`list_for_run` on purpose:
+        that one feeds ``_evidence_from_row`` and needs the full row, while this one feeds
+        the projection and must not depend on how the entity mapper names its columns.
+        ``entity_id`` is selected even when NULL, because the projection counts those
+        observation-only rows instead of dropping them.
+        """
+        return self._fetch_all(
+            "SELECT e.id AS evidence_id, e.entity_type, e.entity_id FROM evidence e "
+            "JOIN tool_runs tr ON tr.id = e.tool_run_id "
+            "JOIN tasks t ON t.id = tr.task_id "
+            "WHERE t.run_id = %s ORDER BY e.id",
+            (run_id,),
         )
 
 
@@ -509,6 +651,15 @@ class TechnologyRepository(BaseRepository):
             (name, category),
         )
         return cur.fetchone()
+
+    def list_by_ids(self, technology_ids: Sequence[UUID]) -> list[dict]:
+        """Technologies by primary key (Phase 15 projection read)."""
+        if not technology_ids:
+            return []
+        return self._fetch_all(
+            "SELECT * FROM technologies WHERE id = ANY(%s::uuid[]) ORDER BY name, id",
+            (list(technology_ids),),
+        )
 
 
 class AssetTechnologyRepository(BaseRepository):
@@ -533,6 +684,24 @@ class AssetTechnologyRepository(BaseRepository):
             (asset_id, technology_id, confidence, evidence_id),
         )
         return cur.fetchone()
+
+    def list_for_assets(self, asset_ids: Sequence[UUID]) -> list[dict]:
+        """Asset -> technology bindings for a set of assets (Phase 15 read).
+
+        Unlike ``asset_ips`` this table *does* carry ``evidence_id``, so the binding's own
+        provenance exists. It still does not name a run, though: the id belongs to an
+        ``evidence`` row whose ``entity_type`` is ``asset_technology`` with a NULL
+        ``entity_id`` (the composite primary key has no id of its own to cite). The
+        projection therefore does not treat ``evidence_id`` as run attribution and uses
+        endpoint containment for this edge too.
+        """
+        if not asset_ids:
+            return []
+        return self._fetch_all(
+            "SELECT asset_id, technology_id, evidence_id FROM asset_technologies "
+            "WHERE asset_id = ANY(%s::uuid[]) ORDER BY asset_id, technology_id",
+            (list(asset_ids),),
+        )
 
 
 class HypothesisRepository(BaseRepository):
@@ -851,3 +1020,70 @@ class Repositories(Storage):
                 run_id, hypothesis_id, review_status, review_reason, truth_label, status
             )
         )
+
+    # -- Phase 15: run-scoped canonical read projection -------------------------
+    #
+    # This is the read counterpart to ``ingest_observations``. It is strictly a SELECT
+    # path: no writes, no task or tool creation, no scope evaluation, no network. It is
+    # additive to the ``Storage`` contract above, and the orchestrator/API probe for it
+    # duck-typed, exactly like ``set_run_progress``.
+
+    def list_tool_runs(self, run_id: UUID) -> list[ToolRun]:
+        """Tool runs for a run as entities (Phase 15 served-report input)."""
+        return [_tool_run_from_row(row) for row in self.tool_runs.list_for_run(run_id)]
+
+    def list_evidence(self, run_id: UUID) -> list[Evidence]:
+        """Evidence for a run as entities (Phase 15 served-report input)."""
+        return [_evidence_from_row(row) for row in self.evidence.list_for_run(run_id)]
+
+    def attack_surface(self, run_id: UUID) -> dict:
+        """Project one run's persisted facts into a serialized attack surface.
+
+        The single production entry point for Phase 15. Composed from reads that already
+        exist (each owned by the per-table repository that owns its SQL) plus the pure
+        transformation in :mod:`database.projection`:
+
+        1. read this run's evidence rows, scoped by
+           ``evidence -> tool_runs -> tasks.run_id``;
+        2. resolve the entity ids those rows actually name;
+        3. batch-read exactly those entities and their associations;
+        4. transform to ``correlation.records`` and run the committed graph and
+           inference engine over them.
+
+        Nothing is cached and nothing is persisted, so two reads of an unchanged run
+        return equal payloads. Returns ``None`` for a run that does not exist, which lets
+        the API answer 404 instead of projecting an empty surface for a bad id.
+        """
+        if self.runs.get(run_id) is None:
+            return None
+        facts, entity_ids = RunFacts.from_evidence_rows(
+            self.evidence.list_fact_refs_for_run(run_id)
+        )
+        if not entity_ids:
+            # A real run that observed nothing. Distinct from a storage backend with no
+            # canonical store at all, which never reaches this method.
+            return serialize(project(run_id, facts))
+
+        asset_ids = sorted(entity_ids.get(ENTITY_ASSET, ()), key=str)
+        facts = replace(
+            facts,
+            assets=tuple(self.assets.list_by_ids(asset_ids)),
+            ips=tuple(self.ips.list_by_ids(sorted(entity_ids.get(ENTITY_IP, ()), key=str))),
+            ports=tuple(self.ports.list_by_ids(sorted(entity_ids.get(ENTITY_PORT, ()), key=str))),
+            web_apps=tuple(
+                self.web_apps.list_by_ids(sorted(entity_ids.get(ENTITY_WEB_APP, ()), key=str))
+            ),
+            technologies=tuple(
+                self.technologies.list_by_ids(
+                    sorted(entity_ids.get(ENTITY_TECHNOLOGY, ()), key=str)
+                )
+            ),
+            # Associations are restricted to this run's evidenced assets on purpose.
+            # ``build_records`` then applies endpoint containment, so an edge is emitted
+            # only once both of its endpoints are themselves run-evidenced.
+            asset_ips=tuple(self.asset_ips.list_for_assets(asset_ids)),
+            asset_technologies=tuple(
+                self.asset_technologies.list_for_assets(asset_ids)
+            ),
+        )
+        return serialize(project(run_id, facts))

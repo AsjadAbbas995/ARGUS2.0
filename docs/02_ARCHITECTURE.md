@@ -29,7 +29,7 @@ CLI / API / Dashboard
         ↓
     PostgreSQL
         ↓
-  Attack-Surface Graph
+  Attack-Surface Graph   (read-only projection, Phase 15)
         ↓
   AI Intelligence Layer
         ↓
@@ -42,7 +42,7 @@ CLI / API / Dashboard
 
 | Layer | Responsibility | Key Modules |
 |---|---|---|
-| Interface | CLI, future FastAPI, future dashboard | `api/server.py`, CLI entrypoint |
+| Interface | CLI, FastAPI, future dashboard | `api/server.py`, CLI entrypoint |
 | Run Management | Run creation, persistence, intake-level scope validation | `runs` model (`05_DATA_MODEL.md`), intake layer |
 | Control/Orchestration | Run and task lifecycle, scheduling | `core/orchestrator.py`, `core/scheduler.py`, `core/task_planner.py` |
 | Safety | Scope enforcement, rate control | `core/scope_guard.py`, `core/rate_limiter.py` |
@@ -50,6 +50,7 @@ CLI / API / Dashboard
 | Recon Adapters | Tool-specific command/parse logic | `recon/**` |
 | Parsing/Normalization | Raw output → canonical objects | adapter `parse()` methods, `intelligence/**` |
 | Persistence | Authoritative data store | `database/**` |
+| Projection | Run-scoped canonical rows → correlation records (read-only) | `database/projection.py` |
 | Correlation/Graph | Relationship reasoning over normalized data | `correlation/**` |
 | AI | Reasoning, hypothesis generation, prioritization | `ai/**` |
 | Evidence | Traceable evidence records | `evidence/**` |
@@ -72,7 +73,10 @@ CLI / API / Dashboard
 - **Parser/Normalizer** — converts raw tool output into canonical, deduplicated objects
 - **PostgreSQL** — the authoritative source of truth (`05_DATA_MODEL.md`)
 - **Attack-Surface Graph** — relationship view over normalized data (built on PostgreSQL now;
-  Neo4j is an optional future backend)
+  Neo4j is an optional future backend). Since Phase 15 it is a **read-only projection**: run-scoped
+  evidence selects the rows, `database/projection.py` transforms them into the `correlation`
+  record types, and the committed graph/inference builders run unchanged. It is derived in memory
+  and never persisted — see `PHASE_15_PROPOSAL.md` §3.
 - **AI Intelligence Layer** — agents that read structured context and produce structured,
   evidence-referenced output (`07_AI_AGENTS.md`)
 - **Evidence system** — links every AI statement back to the tool run/observation that produced
@@ -84,6 +88,13 @@ CLI / API / Dashboard
 `Target intake → Scope validation → Tool execution → Raw output capture → Parsing →
 Normalization → Persistence → Graph correlation → AI analysis → New task proposals → Scope
 Guard → Execution (loop)`.
+
+The persistence → correlation edge is a one-way read: `Repositories.attack_surface(run_id)`
+selects only entities carrying evidence in that run
+(`evidence.tool_run_id → tool_runs.task_id → tasks.run_id`), never by ownership or timestamp.
+Association rows are projected only when both endpoints are run-evidenced, so one run's graph can
+never contain an edge another run is the only party able to justify. The projection never writes,
+never resolves DNS, performs HTTP, invokes a tool, or touches scope.
 
 ## Control Flow
 
