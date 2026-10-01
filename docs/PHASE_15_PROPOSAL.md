@@ -331,4 +331,5 @@ rebuilds the schema with `DROP SCHEMA public CASCADE` / `CREATE SCHEMA public` i
 - No test was weakened or skipped to obtain a green result.
 - No BLOCKER or HIGH findings remain open.
 
-- Status: verified; committed locally, not pushed.
+- Status: VERIFIED.
+- Feature commit: `77a2de35c47470dbe12657f72998270aeee1ecb3` (committed locally, not pushed).
