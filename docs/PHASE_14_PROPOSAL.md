@@ -353,6 +353,6 @@ receive it only through `ARGUS_TEST_DATABASE_URL`.
 - `.byte/` remains untracked and unmodified.
 - No BLOCKER or HIGH findings remain open.
 
-- Final commit: _(pending — not committed or pushed, as instructed)_
+- Final commit: d9e63321935cd4d6055591cc262c25cdfe8b91a8
+- Status: committed locally; not pushed.
 - Final audit status: **VERIFIED**
-
