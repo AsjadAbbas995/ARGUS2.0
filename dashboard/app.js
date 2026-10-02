@@ -2,6 +2,13 @@
  * Dependency-free vanilla JS. Every action is a single, explicit operator step:
  * Approve or Reject a specific hypothesis. There is deliberately NO "approve all"
  * or bulk control on this page, in this client, or in the API (by design).
+ *
+ * Phase 17 adds a read-only AI analysis panel for the selected run, rendered from
+ * GET /runs/{id}/ai-analysis through the same authenticated fetch used by every other
+ * call on this page. It adds no control, no credential handling and no framework: the
+ * analysis records are shown as they were persisted, and there is deliberately no way to
+ * act on them here -- promoting a proposal to a validated finding is still exclusively
+ * the explicit approve step on a hypothesis below.
  */
 (function () {
   "use strict";
@@ -16,6 +23,11 @@
   var hySec = document.getElementById("hypotheses");
   var hyList = document.getElementById("hypoList");
   var runTitle = document.getElementById("currentRun");
+  var aiSec = document.getElementById("aiAnalysis");
+  var aiList = document.getElementById("aiList");
+  var aiEmpty = document.getElementById("aiEmpty");
+  var aiDiag = document.getElementById("aiDiag");
+  var runTitleAnalysis = document.getElementById("currentRunAnalysis");
 
   var apiKey = "";
   var base = "/api/v1";
@@ -90,10 +102,78 @@
   function openRun(runId, status) {
     currentRun = runId;
     runTitle.textContent = "Run " + runId + " (" + status + ")";
+    runTitleAnalysis.textContent = "Run " + runId;
     hySec.hidden = false;
+    aiSec.hidden = false;
     request("GET", "/runs/" + runId + "/hypotheses")
       .then(renderHypotheses)
       .catch(function (e) { warn(e.message); });
+    loadAiAnalysis(runId);
+  }
+
+  /* The AI panel is supplementary: a failure to read it must never disturb the
+   * hypotheses the operator is here to review, so it reports its own state inline
+   * instead of raising the page-level warning. */
+  function loadAiAnalysis(runId) {
+    aiList.innerHTML = "";
+    aiEmpty.hidden = true;
+    aiDiag.textContent = "Loading...";
+    request("GET", "/runs/" + runId + "/ai-analysis")
+      .then(renderAiAnalysis)
+      .catch(function (e) {
+        aiList.innerHTML = "";
+        aiDiag.textContent = "AI analysis unavailable: " + e.message;
+      });
+  }
+
+  function renderAiAnalysis(data) {
+    aiList.innerHTML = "";
+    var items = data.ai_analysis || [];
+    aiEmpty.hidden = items.length > 0;
+    /* Surface why there is nothing to show. Before Phase 17 an empty analysis
+     * list was ambiguous between "AI was never wired" and "AI found nothing";
+     * the API now reports that distinction. */
+    var d = data.diagnostics || {};
+    var parts = ["count: " + items.length];
+    if (d.status) { parts.push("status: " + d.status); }
+    if (d.enabled === false) { parts.push("AI disabled in configuration"); }
+    if (d.wired === false) { parts.push("intelligence layer not wired"); }
+    aiDiag.textContent = parts.join(" -- ");
+    items.forEach(function (a) { aiList.appendChild(aiCard(a)); });
+  }
+
+  function aiCard(a) {
+    var card = document.createElement("article");
+    card.className = "card";
+    card.dataset.analysisId = a.id;
+
+    var head = document.createElement("div");
+    head.className = "meta";
+    head.textContent = a.id + " -- " + (a.proposal_type || "unknown") +
+      " -- agent " + (a.agent_name || "") + " -- truth label " + (a.truth_label || "UNLABELLED");
+
+    var kind = document.createElement("p");
+    kind.className = "stmt";
+    kind.textContent = "model: " + (a.model_used || "") +
+      (a.target ? " -- target: " + a.target : "");
+
+    card.appendChild(head);
+    card.appendChild(kind);
+
+    var ev = a.evidence;
+    if (ev && ev.length) {
+      var e = document.createElement("p");
+      e.className = "meta";
+      e.textContent = "evidence: " + ev.join(", ");
+      card.appendChild(e);
+    }
+    if (a.created_at) {
+      var t = document.createElement("p");
+      t.className = "meta";
+      t.textContent = "recorded: " + a.created_at;
+      card.appendChild(t);
+    }
+    return card;
   }
 
   function renderHypotheses(data) {

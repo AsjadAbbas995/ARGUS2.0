@@ -407,15 +407,41 @@ type: "js_analysis", target: "https://example.com/app.js", status: "pending", pr
 | Column | Type | Notes |
 |---|---|---|
 | id | uuid | primary key |
+| run_id | uuid | FK → runs, nullable column; added by migration `0005` |
 | agent_name | text | ReconAgent / APIAgent / JSAgent / etc. |
 | model_used | text | local / cloud model identifier |
 | input_context_ref | text | pointer to the context supplied |
 | output | jsonb | structured agent output |
 | created_at | timestamptz | |
-**Primary key:** `id`. **Foreign keys:** none direct (referenced *by* `hypotheses`/`tasks` via
-`evidence`). **Indexes:** `agent_name`. **Unique:** none. **Relationships:** may generate
-`hypotheses` and new `tasks`. **Lifecycle:** immutable once written (audit trail). **Example:**
-`{agent_name: "AuthZAgent", model_used: "cloud", output: {...}}`.
+**Primary key:** `id`. **Foreign keys:** `run_id → runs.id` (nullable column, migration `0005`).
+**Indexes:** `agent_name`, `(run_id)` (`ai_analysis_run_id_idx`). **Unique:** none.
+**Relationships:** belongs to a run; may generate `hypotheses` and new `tasks`; its cited evidence
+ids are preserved inside `output`. **Lifecycle:** immutable once written (audit trail).
+**Example:** `{run_id: ..., agent_name: "AuthZAgent", model_used: "cloud", output: {...}}`.
+
+### Why `run_id` is a nullable column with a NOT NULL check
+
+Migration `0005` added `run_id` **nullable** so a populated legacy `ai_analysis` table upgrades
+without rewriting history, and added `ai_analysis_run_id_required_check CHECK (run_id IS NOT
+NULL) NOT VALID`. PostgreSQL applies a `NOT VALID` check to every row written *from that point on*
+while exempting rows that already existed, so:
+
+- every Phase 17 write is run-scoped — enforced by the database, not by convention;
+- a legacy row that migration `0005` could not attribute keeps `run_id IS NULL` and stays honestly
+  un-attributed.
+
+The backfill attributes a row only when `input_context_ref` is a canonical `run:<uuid>` **and** that
+run exists. Anything else — a malformed reference, a reference to a run that is not in the database,
+a different shape entirely — keeps `run_id IS NULL`. It is never assigned to an arbitrary run.
+
+Because `run_id` can be `NULL`, the constraint stays `NOT VALID` on such a database (a fresh
+install has no legacy rows, validates immediately, and ends fully enforced). Run-scoped reads are
+always `WHERE run_id = %s`, so an unattributable row is invisible to them rather than being
+surfaced as some run's analysis.
+
+`input_context_ref` is deliberately **kept**. It names the context an agent was given, which a run
+id alone does not carry, and it is what the `0005` backfill attributes legacy rows from. After
+`0005` it is a context label, not the run filter.
 
 ---
 
@@ -423,12 +449,18 @@ type: "js_analysis", target: "https://example.com/app.js", status: "pending", pr
 
 ```text
 organizations → programs → runs → tasks → tool_runs → evidence
+                                       ↖ hypotheses ↖ ai_analysis
 ```
 
 `runs` is the top-level execution record for one engagement. `tasks` are units of work within a
 run; `tool_runs` are executions of a tool adapter for a task; `evidence` and observation records
 attach to tool runs. Tasks belong to runs via `tasks.run_id → runs.id`; tool runs belong to
 tasks via `tool_runs.task_id → tasks.id`. This is the single, authoritative parent chain.
+
+`hypotheses` and `ai_analysis` both belong to a run (`run_id → runs.id`, `hypotheses` via migration
+`0002`, `ai_analysis` via migration `0005`). They are joined to the rest of the chain *through*
+`evidence` rather than by a direct link: a claim cites the evidence rows that support it, and the
+ids it cited are preserved inside the record that made the claim.
 
 ## Graph Relationships (Cross-Entity)
 

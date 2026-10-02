@@ -5,6 +5,10 @@ Projects the **same** underlying report dict that ``reports.json_report.build_re
 
 - Facts (run metadata, assets, task surface, tool runs, dedup, and the Phase 15 projected
   attack-surface graph) are rendered from their own committed sections.
+- Phase 17 adds a ``# AI Analysis`` section: the run's persisted agent-invocation records. It is
+  rendered *before* the hypotheses because it is upstream of them, and it is never merged into
+  ``validated_findings`` -- an analysis record is what the intelligence layer did, not a claim
+  about the target.
 - Hypotheses stay in a clearly labelled ``# Hypotheses`` section; each item carries its stored
   ``truth_label`` and ``confidence`` - never re-ranked, never merged with validated findings.
 - Validated findings and the evidence chain are separate, labelled sections.
@@ -30,14 +34,27 @@ _DEDUP = "dedup"
 _ASSETS = "assets"
 _RUN = "run"
 _ATTACK_SURFACE = "attack_surface"
+_AI_ANALYSIS = "ai_analysis"
 
 _LABELS = {"HYPOTHESIS", "UNVERIFIED_CLAIM", "VALIDATED_FINDING"}
+
+
+def _flat(value: Any) -> str:
+    """Collapse a value to a single line.
+
+    Markdown in this module is not escaped -- that is the established convention here -- so the
+    one thing that must be guaranteed is that an interpolated value cannot break out of the line
+    it was written into. Agent proposals are free text and may legitimately contain newlines,
+    so every interpolated value is flattened rather than trusted.
+    """
+    return " ".join(str(value or "").split())
 
 
 def render(report: Mapping[str, Any]) -> str:
     """Render ``report`` to deterministic, facts-vs-hypotheses-separated Markdown."""
     parts: list[str] = [_TOP]
     parts.append(_facts_section(report))
+    parts.append(_ai_analysis_section(report))
     parts.append(_hypotheses_section(report))
     parts.append(_findings_section(report))
     parts.append(_evidence_section(report))
@@ -154,6 +171,50 @@ def _nested_section(out: list[str], heading: str, section: Any) -> None:
             label = str(item.get("type", item.get("tool_name", item.get("id", ""))))
             status = str(item.get("status", ""))
             out.append(f"- {label} [{status}]: {str(item.get('target', ''))}")
+
+
+def _ai_analysis_section(report: Mapping[str, Any]) -> str:
+    """Render the run's persisted AI analysis, or nothing when the section is absent.
+
+    A missing key means "this report was built by a caller with no analysis store", which is
+    different from an empty list meaning "the run was analysed and proposed nothing". Only the
+    latter is worth a heading, so the section is omitted entirely in the former case -- the same
+    convention ``attack_surface`` already uses.
+
+    Rendered before ``# Hypotheses`` because these are upstream of them: an analysis record is
+    the intelligence layer's account of one agent invocation, and a hypothesis is what the
+    operator reviews. Nothing here is a finding.
+    """
+    items = report.get(_AI_ANALYSIS)
+    if not isinstance(items, list):
+        return ""
+    out: list[str] = ["# AI Analysis\n"]
+    if not items:
+        out.append("_No AI analysis recorded._\n")
+        return "".join(out) + _DIVIDER
+    for a in items:
+        if not isinstance(a, Mapping):
+            continue
+        out.append(
+            "- `{id}` **{kind}** agent={agent} truth_label={truth} model={model}".format(
+                id=_flat(a.get("id")),
+                kind=_flat(a.get("proposal_type") or "unknown"),
+                agent=_flat(a.get("agent_name")),
+                truth=_flat(a.get("truth_label") or "UNLABELLED"),
+                model=_flat(a.get("model_used")),
+            )
+        )
+        target = _flat(a.get("target"))
+        if target:
+            out.append(f"  target={target}")
+        evidence = a.get("evidence")
+        if isinstance(evidence, list) and evidence:
+            ids = ", ".join(_flat(e) for e in evidence)
+            out.append(f"  evidence=[{ids}]")
+        created = _flat(a.get("created_at"))
+        if created:
+            out.append(f"  created_at={created}")
+    return "".join(out) + _DIVIDER
 
 
 def _hypotheses_section(report: Mapping[str, Any]) -> str:

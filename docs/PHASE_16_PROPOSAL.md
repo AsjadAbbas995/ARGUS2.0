@@ -330,8 +330,12 @@ guard. Any exception returns `[]` and records the reason on `last_result`. Nothi
 | `compileall ai database core api tests` | clean |
 | `git diff --check` | clean |
 
-PostgreSQL: existing ARGUS test cluster, PostgreSQL 17.11, role `argus`, database `argus_test`,
-`trust` auth on `127.0.0.1` as originally provisioned. No authentication change was made.
+PostgreSQL: a **temporary copy** of the ARGUS cluster, PostgreSQL 17.11, on port **5433**, role
+`argus` (created by `initdb -U argus`), database `argus_test`, `trust` auth on `127.0.0.1` — the
+provisioning Phase 14 §11.5 describes. No authentication change was made, and this is **not** the
+production service: the production cluster on port 5432 has no `argus` role and is
+`scram-sha-256` throughout. Phase 17 §12.2 tabulates both clusters, because the two documents
+describing them read as one continuous account and the role name differs between them.
 
 ### 11.5 Defects found and fixed during implementation
 

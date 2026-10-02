@@ -148,6 +148,14 @@ DOC_COLUMNS: dict[str, list[str]] = {
     ],
     "ai_analysis": [
         "id",
+        # Phase 17, migration 0005: the run that owns this analysis. Nullable in the
+        # column so a populated legacy table upgrades without rewriting history, and
+        # enforced NOT NULL on new writes by ``ai_analysis_run_id_required_check``;
+        # a row migration 0005 could not attribute keeps NULL and stays invisible to
+        # every run-scoped read. Discovered automatically from the migration by
+        # ``_columns_added_by_later_migrations`` -- listed here because the documented
+        # schema is the post-migration schema.
+        "run_id",
         "agent_name",
         "model_used",
         "input_context_ref",

@@ -38,11 +38,27 @@ The agents are rule-based, so the same persisted run and task list always produc
 proposals, the same rows, and the same tasks. Row ids remain server-generated (``uuid4``) and so
 are not part of that guarantee -- Phase 14 already established that ``entity_id`` is never
 trusted from tool output, and the same rule applies to what an agent proposes. See
-``PHASE_16_PROPOSAL.md`` §2.2 for why real model backends are deferred to Phase 17.
+``PHASE_16_PROPOSAL.md`` §2.2 for why real model backends are deferred.
+
+Phase 17
+--------
+Phase 17 changes persistence attribution and observability only; the agents, the contract,
+the validation rules and the truth labels are untouched.
+
+* **Attribution.** ``ai_analysis.run_id`` (migration ``0005``) is a real foreign key. Every row
+  written here carries the run's id, so run-scoped retrieval is an indexed ``WHERE run_id = %s``
+  instead of a text-prefix match on ``input_context_ref``. ``input_context_ref`` is still
+  written: it is the context label the ``0005`` backfill attributes legacy rows from, and it
+  names the context an agent was given.
+* **Observability.** A pass that could previously fail silently now records why on
+  :attr:`AnalysisResult.status` and logs it. The set of outcomes, the returned tasks, the
+  fail-closed guarantees and the "proposal-only" persistence semantics are unchanged:
+  ``None`` still writes no row, and a failing agent still rolls back only its own transaction.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional, Sequence
 from uuid import UUID
@@ -55,11 +71,42 @@ from .router import RouteConfig
 from .run_context import hypothesis_context, recon_context, uncovered_without_capability
 from .validator import validate_structured_output
 
+log = logging.getLogger(__name__)
+
 #: Truth labels the hook may persist. ``VALIDATED_FINDING`` is absent by design and
 #: :func:`_hypothesis_from` refuses it -- only ``Orchestrator.approve_hypothesis`` may write it,
 #: after operator review.
 PERSISTABLE_TRUTH_LABELS = frozenset(
     {"FACT", "OBSERVATION", "INFERENCE", "HYPOTHESIS", "UNVERIFIED_CLAIM"}
+)
+
+#: Why a pass produced what it produced. Phase 17 adds these because the hook could
+#: previously only fail *silently*: a storage with no ``attack_surface`` and a pass that
+#: legitimately found nothing were indistinguishable from outside the hook, so "the AI
+#: layer is broken" and "the AI layer had nothing to say" looked identical to an operator.
+#:
+#: These are coarse, non-sensitive states. They never carry an exception message, so
+#: surfacing one over the API cannot leak internals; the detail stays in the log.
+#:
+#: ``ANALYSIS_DISABLED`` and ``ANALYSIS_UNWIRED`` are *not* here, because a hook does not
+#: exist in either case and therefore cannot report on itself. They are reported by
+#: ``api.serve`` through ``app.state``.
+ANALYSIS_CAPABILITY_UNAVAILABLE = "capability_unavailable"
+ANALYSIS_CONTEXT_FAILED = "context_failed"
+ANALYSIS_NO_PROPOSALS = "no_proposals"
+ANALYSIS_PROPOSED = "proposed"
+ANALYSIS_PASS_FAILED = "pass_failed"
+
+#: Every state :attr:`AnalysisResult.status` can hold. Bounded so a caller cannot be
+#: handed an unexpected string, and so the diagnostic vocabulary stays greppable.
+ANALYSIS_STATUSES = frozenset(
+    {
+        ANALYSIS_CAPABILITY_UNAVAILABLE,
+        ANALYSIS_CONTEXT_FAILED,
+        ANALYSIS_NO_PROPOSALS,
+        ANALYSIS_PROPOSED,
+        ANALYSIS_PASS_FAILED,
+    }
 )
 
 _PRIORITIES = frozenset({"low", "medium", "high"})
@@ -101,15 +148,37 @@ class AgentOutcome:
 
 @dataclass
 class AnalysisResult:
-    """Everything one analysis pass produced. Exposed for tests and audit."""
+    """Everything one analysis pass produced. Exposed for tests and audit.
+
+    ``status`` is the Phase 17 diagnostic: one of :data:`ANALYSIS_STATUSES`, naming why
+    the pass ended the way it did. It exists so a silent no-op is distinguishable from a
+    pass that legitimately produced nothing. ``error`` carries the *detail* for logs and
+    tests; it is never surfaced to an API client.
+    """
 
     outcomes: tuple[AgentOutcome, ...] = field(default_factory=tuple)
     tasks: tuple[Task, ...] = field(default_factory=tuple)
     uncovered_without_capability: tuple[str, ...] = field(default_factory=tuple)
+    status: str = ANALYSIS_NO_PROPOSALS
+    error: Optional[str] = None
 
     @property
     def proposals(self) -> tuple[Mapping[str, Any], ...]:
         return tuple(o.proposal for o in self.outcomes if o.proposal is not None)
+
+    @property
+    def ran(self) -> bool:
+        """Whether this pass actually reached the agents.
+
+        ``False`` for a pass that bailed before invoking anything -- a storage with no
+        ``attack_surface``, or a context that could not be built. Both used to be
+        indistinguishable from "ran, found nothing".
+        """
+        return self.status not in (
+            ANALYSIS_CAPABILITY_UNAVAILABLE,
+            ANALYSIS_CONTEXT_FAILED,
+            ANALYSIS_PASS_FAILED,
+        )
 
 
 class AnalysisHook:
@@ -145,17 +214,47 @@ class AnalysisHook:
         malformed input just as an agent can raise on a surprising fact. A hook that let that
         escape would fail the run it was only ever supposed to advise -- which is the exact
         failure mode this module promises it will not have.
+
+        Phase 17 adds no behaviour here: the guard, the fail-closed result and the returned
+        tasks are byte-identical to Phase 16. What changed is that every early return now
+        records *why* it happened on :attr:`last_result`, so a storage that cannot feed the
+        agents is visible instead of silent.
         """
         surface = self._surface(run)
         if surface is None:
-            self.last_result = AnalysisResult()
+            # Not a failure: a storage with no canonical fact store has nothing to analyse.
+            # Logged at warning because in production it means the composition is mis-wired,
+            # and recorded on ``last_result`` so an operator can tell it from a clean pass.
+            log.warning(
+                "analysis pass skipped: storage %s cannot provide the attack-surface "
+                "projection the agents read; no analysis was performed",
+                type(self.storage).__name__,
+            )
+            self.last_result = AnalysisResult(status=ANALYSIS_CAPABILITY_UNAVAILABLE)
             return []
 
         try:
             run_id = run.id
             snapshot = getattr(run, "configuration_snapshot", None)
-            recon_ctx = recon_context(surface, snapshot, tasks, sorted(self.runnable))
-            hypothesis_ctx = hypothesis_context(surface, snapshot)
+            try:
+                recon_ctx = recon_context(surface, snapshot, tasks, sorted(self.runnable))
+                hypothesis_ctx = hypothesis_context(surface, snapshot)
+            except Exception as exc:
+                # Context construction is separated from the outer guard purely so the
+                # diagnostic can say *which* stage failed. The result is the same either way:
+                # no context, so no agent runs, so no tasks and no writes.
+                log.warning(
+                    "analysis pass skipped: could not build agent context from the "
+                    "projection for run %s: %s: %s",
+                    run_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                self.last_result = AnalysisResult(
+                    status=ANALYSIS_CONTEXT_FAILED,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                return []
             gaps = recon_ctx.gaps
 
             outcomes = [
@@ -189,9 +288,19 @@ class AnalysisHook:
                 uncovered_without_capability=uncovered_without_capability(
                     tasks, sorted(self.runnable)
                 ),
+                # "ran and proposed" is measured by what was actually persisted, not by
+                # whether an agent returned something: a proposal that failed validation or
+                # could not be persisted proposed no new work.
+                status=ANALYSIS_PROPOSED if proposed or hypotheses_written else ANALYSIS_NO_PROPOSALS,
             )
             return proposed
         except Exception as exc:
+            log.warning(
+                "analysis pass failed for run %s: %s: %s",
+                getattr(run, "id", "<unknown>"),
+                type(exc).__name__,
+                exc,
+            )
             self.last_result = AnalysisResult(
                 outcomes=(
                     AgentOutcome(
@@ -200,7 +309,9 @@ class AnalysisHook:
                         None,
                         error=f"{type(exc).__name__}: {exc}",
                     ),
-                )
+                ),
+                status=ANALYSIS_PASS_FAILED,
+                error=f"{type(exc).__name__}: {exc}",
             )
             return []
 
@@ -273,6 +384,11 @@ class AnalysisHook:
             return False
 
         record = AiAnalysis(
+            # Phase 17: the real run id, so ``list_ai_analysis(run_id)`` is an indexed
+            # ``WHERE run_id = %s`` rather than a text-prefix match on
+            # ``input_context_ref``. ``input_context_ref`` is still written below -- it
+            # records the context the agent was given, which a run id does not carry.
+            run_id=run_id,
             agent_name=outcome.agent_name,
             model_used=outcome.model_used,
             input_context_ref=context_ref(run_id),
@@ -295,7 +411,17 @@ class AnalysisHook:
                 insert_analysis(record)
                 if hypothesis is not None:
                     self._insert_hypothesis(hypothesis)
-        except Exception:
+        except Exception as exc:
+            # Phase 16 already failed closed here (return False, write nothing). Phase 17
+            # adds only a log line, so a rejected analysis row is visible to an operator
+            # through the process log instead of vanishing.
+            log.warning(
+                "analysis persistence failed for agent %r on run %s: %s: %s",
+                outcome.agent_name,
+                run_id,
+                type(exc).__name__,
+                exc,
+            )
             return False
         return True
 

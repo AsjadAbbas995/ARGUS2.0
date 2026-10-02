@@ -3,9 +3,10 @@
 Projects the **same** underlying report dict that ``build_report`` builds in
 ``reports/json_report.py`` (so JSON / Markdown / HTML all render one data object) and keeps the
 truth-label contract: run/task/tool-run/asset/dedup facts and the Phase 15 projected attack-surface
-graph in their own section, hypotheses in a clearly labelled ``# Hypotheses`` block with stored
-``truth_label`` and ``confidence``, validated findings separate, and the evidence chain traceable -
-facts are never blended with hypotheses.
+graph in their own section, the Phase 17 ``ai_analysis`` records in their own section, hypotheses
+in a clearly labelled ``# Hypotheses`` block with stored ``truth_label`` and ``confidence``,
+validated findings separate, and the evidence chain traceable - facts are never blended with
+hypotheses.
 
 Deterministic by construction: no wall-clock, no randomness, no module state; every list is
 rendered in the exact order fixed by ``build_report``; every emitted string is HTML-escaped so the
@@ -33,12 +34,65 @@ def render(report: Mapping[str, Any]) -> str:
         "<body>\n",
         "<h1>ARGUS Run Report</h1>\n",
         _facts_section(report),
+        _ai_analysis_section(report),
         _hypotheses_section(report),
         _findings_section(report),
         _evidence_section(report),
         "</body>\n",
         "</html>\n",
     ]
+    return "".join(out)
+
+
+def _ai_analysis_section(report: Mapping[str, Any]) -> str:
+    """Render the run's persisted AI analysis, or nothing when the section is absent.
+
+    Phase 17. A missing key means "this report was built by a caller with no analysis store",
+    which is different from an empty list meaning "the run was analysed and proposed nothing";
+    only the latter gets a heading. Rendered before the hypotheses because these records are
+    upstream of them, and never merged into ``validated_findings``.
+    """
+    items = report.get("ai_analysis")
+    if not isinstance(items, list):
+        return ""
+    out: list[str] = ["<section id=\"ai_analysis\">\n", "<h2>AI Analysis</h2>\n"]
+    if not items:
+        out.append("<p>No AI analysis recorded.</p>\n")
+        out.append("</section>\n")
+        return "".join(out)
+    out.append("<ul>\n")
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        out.append(_ai_analysis_item(item))
+    out.append("</ul>\n")
+    out.append("</section>\n")
+    return "".join(out)
+
+
+def _ai_analysis_item(item: Mapping[str, Any]) -> str:
+    kind = escape(str(item.get("proposal_type") or "unknown"))
+    truth = escape(str(item.get("truth_label") or "UNLABELLED"))
+    agent = escape(str(item.get("agent_name") or ""))
+    model = escape(str(item.get("model_used") or ""))
+    ident = escape(str(item.get("id") or ""))
+    out: list[str] = [
+        "<li><code>{0}</code><br/>".format(ident),
+        "<strong>{0}</strong> - agent={1} truth_label={2} model={3}".format(
+            kind, agent, truth, model
+        ),
+    ]
+    target = str(item.get("target") or "")
+    if target:
+        out.append("<br/>target={0}".format(escape(target)))
+    evidence = item.get("evidence")
+    if isinstance(evidence, list) and evidence:
+        ids = ", ".join(escape(str(e)) for e in evidence)
+        out.append("<br/>evidence=[{0}]".format(ids))
+    created = str(item.get("created_at") or "")
+    if created:
+        out.append("<br/>created_at={0}".format(escape(created)))
+    out.append("</li>\n")
     return "".join(out)
 
 

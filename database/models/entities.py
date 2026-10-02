@@ -176,9 +176,21 @@ class AiAnalysis:
     Safety Boundary") has nowhere to live on the hypothesis row itself. The cited ids are
     preserved here in ``output`` instead, which is why a hypothesis is only trustworthy
     when the ``ai_analysis`` row that produced it is retained alongside it.
+
+    Phase 17 (migration ``0005``) added ``run_id``. Analysis rows are run-scoped audit
+    records, so ownership is a real foreign key rather than a convention inside
+    ``input_context_ref``. ``input_context_ref`` is retained: it names the context the
+    agent was given, which a run id alone does not, and it is what the ``0005`` backfill
+    attributes legacy rows from. It is a context label now, not the run filter.
+
+    ``run_id`` defaults to ``None`` so an unattributable legacy row stays honestly
+    un-attributed and invisible to run-scoped reads rather than being surfaced as some
+    run's analysis. Every row written from Phase 17 on carries a real id: the
+    ``ai_analysis_run_id_required_check`` constraint enforces it for new writes.
     """
 
     id: UUID = field(default_factory=_uuid)
+    run_id: Optional[UUID] = None
     agent_name: str = ""
     model_used: str = ""
     input_context_ref: Optional[str] = None

@@ -415,6 +415,9 @@ def create_serve_app(
     * ``adapters`` overrides the task-type -> adapter table. Production uses
       :func:`_default_adapters`; a controlled harness may inject an adapter that
       drives the real ``ToolRunner`` against a local target.
+    * ``config.ai.enabled`` (Phase 16) decides whether an ``AnalysisHook`` is wired at
+      all, and ``config.ai.max_loop_passes`` (Phase 17) is the adaptive loop's
+      instability budget. Both default to the pre-existing behaviour -- off, and 32.
     """
     # Authentication is a startup precondition, checked before anything is
     # constructed: there is no committed default key to fall back to.
@@ -474,6 +477,11 @@ def create_serve_app(
                 cloud_model=effective_config.ai.cloud_model or "cloud",
             ),
         )
+    else:
+        log.info(
+            "ai.enabled is false: no AnalysisHook is wired and every run walks the "
+            "deterministic Phase 15 path to COMPLETED"
+        )
 
     orch = Orchestrator(
         storage=store,
@@ -481,6 +489,10 @@ def create_serve_app(
         rate_limiter=limiter,
         ingest=_build_ingestor(store, effective_config),
         analysis=analysis,
+        # Phase 17: the loop budget is served policy, not a hardcoded dataclass default. The
+        # default is unchanged (32), so a deployment that configures nothing behaves exactly as
+        # before; this only makes the existing limit reachable from ``argus.yaml``.
+        max_loop_passes=effective_config.ai.max_loop_passes,
     )
 
     app = create_app(orch, api_key=effective_key)
@@ -494,6 +506,12 @@ def create_serve_app(
     app.state.argus_storage = store
     app.state.argus_execution = execution
     app.state.argus_rate_limiter = limiter
+    # Phase 17: whether the intelligence layer is wired at all, so an operator can tell
+    # "this run produced no AI analysis" from "no analysis layer exists in this deployment"
+    # without reading source or inferring it from an empty result. The hook itself reports the
+    # richer per-pass states (``ai.loop.ANALYSIS_STATUSES``) on ``last_result``.
+    app.state.argus_analysis_hook = analysis
+    app.state.argus_analysis_wired = analysis is not None
     return app
 
 

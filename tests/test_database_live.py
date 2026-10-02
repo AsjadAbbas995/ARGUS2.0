@@ -780,10 +780,10 @@ def _foreign_key_names(schema) -> set[str]:
 
 def test_revert_updates_schema_migrations_bookkeeping(schema) -> None:
     """``schema_migrations`` must never claim a version whose schema was reverted."""
-    assert _applied(schema) == [1, 2, 3, 4]
+    assert _applied(schema) == [1, 2, 3, 4, 5]
     assert "WHERE" in _fingerprint_index_def(schema), "0003 must scope the unique index"
 
-    assert revert(schema, 1) == [4, 3, 2]
+    assert revert(schema, 1) == [5, 4, 3, 2]
     assert _applied(schema) == [1], "reverted versions must not stay recorded as applied"
     assert schema.execute(
         "SELECT to_regclass('hypotheses_run_id_idx') AS t"
@@ -792,10 +792,10 @@ def test_revert_updates_schema_migrations_bookkeeping(schema) -> None:
         "reverting 0003 must restore 0001's unconditional unique index"
     )
 
-    # 0002-0004's objects are gone, so apply must re-run them rather than
+    # 0002-0005's objects are gone, so apply must re-run them rather than
     # skipping them because bookkeeping still claimed they were applied.
-    assert apply(schema) == [2, 3, 4]
-    assert _applied(schema) == [1, 2, 3, 4]
+    assert apply(schema) == [2, 3, 4, 5]
+    assert _applied(schema) == [1, 2, 3, 4, 5]
     assert schema.execute(
         "SELECT to_regclass('hypotheses_run_id_idx') AS t"
     ).fetchone()["t"]
@@ -806,7 +806,7 @@ def test_0002_on_fresh_database_validates_run_id_requirement(database_url: str) 
     c = psycopg.connect(database_url)
     try:
         revert(c, 0)
-        assert apply(c) == [1, 2, 3, 4]
+        assert apply(c) == [1, 2, 3, 4, 5]
         assert c.execute(
             "SELECT convalidated FROM pg_constraint "
             "WHERE conname = 'hypotheses_run_id_required_check'"
@@ -851,7 +851,9 @@ def test_0002_upgrades_populated_hypotheses_without_inventing_ownership(
         )
         assert c.execute("SELECT count(*) FROM hypotheses").fetchone()[0] == 1
 
-        assert apply(c) == [2, 3, 4], "0002/0003/0004 must apply to a populated database"
+        assert apply(c) == [2, 3, 4, 5], (
+            "0002-0005 must apply to a populated database"
+        )
 
         run_id, target, review_status = c.execute(
             "SELECT run_id, target, review_status FROM hypotheses"
@@ -885,8 +887,8 @@ def test_0002_downgrade_restores_the_0001_shape(database_url: str) -> None:
     c = psycopg.connect(database_url)
     try:
         revert(c, 0)
-        assert apply(c) == [1, 2, 3, 4]
-        assert revert(c, 1) == [4, 3, 2]
+        assert apply(c) == [1, 2, 3, 4, 5]
+        assert revert(c, 1) == [5, 4, 3, 2]
 
         columns = {
             r[0]
@@ -918,7 +920,7 @@ def test_0004_adds_and_reverts_adaptive_loop_columns(database_url: str) -> None:
     c = psycopg.connect(database_url, row_factory=dict_row)
     try:
         revert(c, 0)
-        assert apply(c) == [1, 2, 3, 4]
+        assert apply(c) == [1, 2, 3, 4, 5]
 
         def columns() -> set[str]:
             return {
@@ -952,7 +954,7 @@ def test_0004_adds_and_reverts_adaptive_loop_columns(database_url: str) -> None:
         assert row["loop_pass"] == 0
         assert row["pass_new_tasks"] is False
 
-        assert revert(c, 3) == [4]
+        assert revert(c, 3) == [5, 4]
         assert not {"loop_pass", "pass_new_tasks"} & columns()
     finally:
         revert(c, 0)

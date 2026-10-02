@@ -234,12 +234,23 @@ class AiConfig:
     ``mode``/``local_model``/``cloud_model`` remain the Phase-6 routing configuration. Phase 16
     makes no model call, so they are recorded on each ``ai_analysis`` row rather than used to
     select a provider; Phase 17 consumes them at that seam.
+
+    ``max_loop_passes`` (Phase 17) is the adaptive loop's instability/safety limit. It was a
+    hardcoded ``Orchestrator`` dataclass default of 32, which meant an operator had no way to
+    tighten or relax the budget short of editing Python. It is process-level policy rather than
+    per-run configuration, for the same reason ``enabled`` is: the loop budget is fixed when the
+    orchestrator is composed, so it does not belong in ``runs.configuration_snapshot``, where a
+    recorded-but-unenforced value would be a lie. A deployment sets it under ``ai:``.
     """
 
     mode: AiMode = AiMode.HYBRID
     local_model: str = ""
     cloud_model: str = ""
     enabled: bool = False
+    #: Instability/safety limit on the adaptive loop (01_PRODUCT_SPEC.md §10). Reached, the run
+    #: ends as ``CANCELLED`` rather than looping. Must be > 0; the default preserves the
+    #: pre-Phase-17 behaviour exactly.
+    max_loop_passes: int = 32
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "AiConfig":
@@ -252,11 +263,23 @@ class AiConfig:
                 f"config.ai.mode must be one of "
                 f"{', '.join(m.value for m in AiMode)} (got {mode_raw!r})"
             ) from exc
+        max_loop_passes = data.get("max_loop_passes", 32)
+        # Same ``_require_positive`` guard the limits section uses. A zero or negative budget
+        # would end the run ``CANCELLED`` before its first analysis pass could contribute, so it
+        # is a configuration mistake and is rejected at load rather than honoured.
+        _require_positive(max_loop_passes, "ai.max_loop_passes")
+        # A pass count is a count, not a rate: ``_require_positive`` accepts a float (correctly,
+        # for e.g. ``requests_per_second``), and ``int(3.5)`` would silently turn a budget of
+        # 3.5 into 3. Rejected rather than truncated -- a budget an operator did not mean is
+        # worse than a config error.
+        if isinstance(max_loop_passes, bool) or int(max_loop_passes) != max_loop_passes:
+            raise ConfigError("config.ai.max_loop_passes must be a whole number")
         return cls(
             mode=mode,
             local_model=str(data.get("local_model") or ""),
             cloud_model=str(data.get("cloud_model") or ""),
             enabled=bool(data.get("enabled", False)),
+            max_loop_passes=int(max_loop_passes),
         )
 
 
@@ -398,6 +421,7 @@ class Config:
                 "local_model": self.ai.local_model,
                 "cloud_model": self.ai.cloud_model,
                 "enabled": self.ai.enabled,
+                "max_loop_passes": self.ai.max_loop_passes,
             },
             "limits": {
                 "requests_per_second": self.limits.requests_per_second,

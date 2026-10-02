@@ -22,6 +22,15 @@ adapter or subprocess, or opens its own database connection. The attack surface 
 the run's evidence on each request rather than cached, so it cannot go stale relative to the
 database it describes. Every storage read here is optional and duck-typed, so a backend that
 predates Phase 15 degrades to an honest empty section instead of raising.
+
+Phase 17 adds ``GET /api/v1/runs/{run_id}/ai-analysis`` and an ``ai_analysis`` report section.
+Both read the run's persisted analysis through the same optional, duck-typed storage seam, run
+scoped by the ``ai_analysis.run_id`` foreign key rather than by a text prefix. Before this the
+intelligence layer was a write-only audit trail: rows were committed but no operator-reachable
+surface could read them, so "the AI ran" could not be established from the API or a report. The
+route also reports a coarse ``diagnostics`` block, because "no analysis" previously had three
+indistinguishable causes (disabled, unwired, or genuinely nothing to propose) and only the last
+is a statement about the target. No diagnostic carries exception text or any credential.
 """
 
 from __future__ import annotations
@@ -165,6 +174,108 @@ def _hypotheses_payload(run_id, hyps) -> dict:
         "count": len(hyps),
         "run_id": str(run_id),
         "hypotheses": [_hypothesis_payload(h) for h in hyps],
+    }
+
+
+#: Proposal fields lifted out of a persisted ``ai_analysis.output`` for the wire contract.
+#:
+#: These are **not** new columns and nothing is invented: each is read straight out of the
+#: stored Common Output Contract object, so the full payload (``output``) remains the record of
+#: truth and these are a convenience projection of it. They exist because ``proposal_type``,
+#: ``truth_label`` and ``evidence`` are the three things an operator triaging a run actually
+#: looks for, and reaching two levels into a jsonb for each one is not a reasonable API.
+#:
+#: An absent contract key yields ``None`` rather than a default: a proposal that genuinely
+#: carries no truth label must not be rendered as if it were, say, ``HYPOTHESIS``.
+_PROPOSAL_EVIDENCE_KEY = "evidence"
+_PROPOSAL_TYPE_KEY = "type"
+_PROPOSAL_TRUTH_LABEL_KEY = "truth_label"
+
+
+def _proposal_field(output: object, key: str):
+    """Read one key from a persisted proposal object, or ``None`` if absent/not a mapping."""
+    if not isinstance(output, Mapping):
+        return None
+    return output.get(key)
+
+
+def _ai_analysis_payload(analysis) -> Mapping[str, object]:
+    """Project a persisted ``AiAnalysis`` row onto the operator wire contract.
+
+    Every field here is a real column of ``ai_analysis`` (``run_id`` since migration ``0005``)
+    or a key of its persisted ``output`` jsonb. Nothing is derived from a target, nothing is
+    inferred, and no agent output is re-validated or re-labelled here.
+
+    ``model_used`` is reported exactly as persisted. Phase 17 makes no model call, so that
+    value names the rule-based router, not a language model -- the field is named honestly and
+    this docstring exists so a future reader does not mistake it for evidence of an LLM.
+    """
+    output = getattr(analysis, "output", None)
+    evidence = _proposal_field(output, _PROPOSAL_EVIDENCE_KEY)
+    return {
+        "id": str(analysis.id),
+        # A legacy row migration 0005 could not attribute reports ``None`` rather than a
+        # fabricated run. Such a row is never returned by the run-scoped query in the first
+        # place; the field is nullable so the shape matches the stored row.
+        "run_id": str(analysis.run_id) if getattr(analysis, "run_id", None) else None,
+        "agent_name": str(analysis.agent_name),
+        "model_used": str(analysis.model_used),
+        "input_context_ref": analysis.input_context_ref,
+        # The complete persisted Common Output Contract object, verbatim.
+        "output": output if isinstance(output, Mapping) else {},
+        # Projections of three keys of that object, for triage. See _PROPOSAL_TYPE_KEY et al.
+        "proposal_type": _proposal_field(output, _PROPOSAL_TYPE_KEY),
+        "truth_label": _proposal_field(output, _PROPOSAL_TRUTH_LABEL_KEY),
+        "evidence": list(evidence) if isinstance(evidence, list) else [],
+        "created_at": analysis.created_at.isoformat()
+        if getattr(analysis, "created_at", None) is not None
+        else None,
+    }
+
+
+def _analysis_diagnostics(app, orchestrator: Orchestrator) -> Mapping[str, object]:
+    """Coarse, non-sensitive description of the intelligence layer's state.
+
+    Phase 17 exists because "the AI produced nothing" had three indistinguishable causes: the
+    layer was disabled, it was enabled but the composition never wired it, or it ran and
+    genuinely had nothing to propose. Only the third is a statement about the target.
+
+    What is reported here is deliberately coarse and deliberately free of internals:
+    ``status`` is drawn from the bounded vocabulary in ``ai.loop.ANALYSIS_STATUSES`` plus the
+    two states a hook cannot report about itself, and no exception text, path, DSN or key ever
+    reaches an API client -- those stay in the process log. A diagnostic read that fails is
+    reported as such and never breaks the run or the response.
+    """
+    from ai.loop import ANALYSIS_STATUSES
+
+    hook = getattr(app.state, "argus_analysis_hook", None)
+    if hook is None:
+        # An unwired hook is reported as "disabled" rather than "unwired" when the served
+        # policy also has it off, because that is the single switch an operator controls; the
+        # two are only distinguishable when the policy says enabled but no hook exists.
+        enabled = bool(getattr(getattr(app.state, "argus_config", None), "ai", None) and
+                       app.state.argus_config.ai.enabled)
+        return {
+            "enabled": enabled,
+            "wired": False,
+            "status": "unwired" if enabled else "disabled",
+        }
+
+    last = getattr(hook, "last_result", None)
+    status = getattr(last, "status", None)
+    if status not in ANALYSIS_STATUSES:
+        # No pass has run for this process yet, or the hook predates the diagnostic.
+        status = "no_pass_yet"
+    return {
+        "enabled": True,
+        "wired": True,
+        "status": status,
+        # The last pass's uncovered stages, i.e. recon work the AI wanted and the served
+        # adapter registry could not execute. Diagnostic, not a task list.
+        "uncovered_without_capability": sorted(
+            str(s) for s in (getattr(last, "uncovered_without_capability", None) or ())
+        ),
+        "max_loop_passes": int(getattr(orchestrator, "max_loop_passes", 0)),
     }
 
 
@@ -612,6 +723,10 @@ def create_app(orchestrator: Orchestrator, api_key: str) -> FastAPI:
         surface = _attack_surface(orchestrator, run_id)
         tool_runs = _read_from_storage(orchestrator, "list_tool_runs", run_id)
         evidence = _read_from_storage(orchestrator, "list_evidence", run_id)
+        # Phase 17: the run's own analysis rows. Read run-scoped (migration 0005 gives
+        # ``ai_analysis`` a real ``run_id``), so a report can only ever contain this run's
+        # analysis -- and a storage without the read degrades to an empty section.
+        ai_analysis = _read_from_storage(orchestrator, "list_ai_analysis", run_id)
         reviewed = [
             _hypothesis_payload(h)
             for h in (orchestrator.list_hypotheses(run_id) or [])
@@ -632,6 +747,7 @@ def create_app(orchestrator: Orchestrator, api_key: str) -> FastAPI:
             ],
             evidence=evidence,
             attack_surface=surface,
+            ai_analysis=[_ai_analysis_payload(row) for row in ai_analysis],
         )
         if fmt == "json":
             return PlainTextResponse(json_report.render(report), media_type="application/json")
@@ -658,6 +774,43 @@ def create_app(orchestrator: Orchestrator, api_key: str) -> FastAPI:
             raise HTTPException(status_code=404, detail="run not found")
         hyps = orchestrator.list_hypotheses(run_id)
         return JSONResponse(_hypotheses_payload(run_id, hyps))
+
+    @app.get("/api/v1/runs/{run_id}/ai-analysis", dependencies=[Depends(_authed)])
+    def list_ai_analysis(run_id: UUID) -> JSONResponse:
+        """The run's persisted AI analysis: one row per agent invocation that proposed.
+
+        Phase 17. Before this route the intelligence layer was a write-only audit trail: rows
+        were persisted but nothing an operator could reach could read them, so "the AI ran"
+        was only ever inferable from a side effect.
+
+        Read-only and run-scoped, on exactly the same terms as every other route here:
+
+        * Bearer-authenticated by the single existing ``_authed`` dependency -- no second
+          authentication mechanism is introduced.
+        * 404 for an unknown run, resolved through ``_require_run`` before any read, so this
+          route cannot be used to distinguish "run does not exist" from "run has no analysis".
+        * Scoped by the ``ai_analysis.run_id`` foreign key (``WHERE run_id = %s``, migration
+          ``0005``), never by a text prefix, so one run can never observe another run's rows and
+          a row that could not be attributed stays invisible. It does not expose the
+          unfiltered ``list_ai_analysis()``.
+        * Performs no write, creates no task, runs no tool, evaluates no scope and makes no
+          network call. It is a projection of rows already committed.
+        * Returns only fields that exist in the persisted model, plus three keys projected out
+          of the stored proposal object (see ``_ai_analysis_payload``).
+        """
+        _require_run(orchestrator, run_id)
+        rows = _read_from_storage(orchestrator, "list_ai_analysis", run_id)
+        # A storage with no run-scoped analysis read (the in-memory development double)
+        # degrades to an honest empty list rather than raising, matching every other optional
+        # read in this module.
+        return JSONResponse(
+            {
+                "run_id": str(run_id),
+                "count": len(rows),
+                "ai_analysis": [_ai_analysis_payload(row) for row in rows],
+                "diagnostics": _analysis_diagnostics(app, orchestrator),
+            }
+        )
 
     @app.post("/api/v1/runs/{run_id}/hypotheses/{hypothesis_id}/approve", dependencies=[Depends(_authed)])
     def approve_hypothesis(run_id: UUID, hypothesis_id: UUID) -> JSONResponse:

@@ -706,17 +706,20 @@ class AssetTechnologyRepository(BaseRepository):
 
 
 class AiAnalysisRepository(BaseRepository):
-    """Canonical ``ai_analysis`` table access (05_DATA_MODEL.md, Phase 16).
+    """Canonical ``ai_analysis`` table access (05_DATA_MODEL.md, Phase 16 / Phase 17).
 
-    One row per agent invocation. The table predates Phase 16 (migration 0001) but had no
-    entity and no repository, so it was unreachable: nothing in production could record
-    that the intelligence layer had run at all.
+    One row per agent invocation that produced a proposal. The table predates Phase 16
+    (migration 0001) but had no entity and no repository, so it was unreachable: nothing
+    in production could record that the intelligence layer had run at all.
 
-    ``ai_analysis`` has **no ``run_id`` column** -- only ``agent_name``/``model_used``/
-    ``input_context_ref``/``output``/``created_at``. Run attribution is therefore carried in
-    ``input_context_ref`` rather than a foreign key, and is recorded there in a documented,
-    parseable form by :mod:`ai.loop`. That is a schema limitation to record, not to migrate
-    around here; it is called out in ``PHASE_16_PROPOSAL.md`` §3.2.
+    Phase 17 (migration ``0005``) added ``run_id``. Until then the table had no
+    ``run_id`` column and run attribution was carried in the ``input_context_ref``
+    *string*, so attributing a row to a run meant a caller matching a text prefix --
+    a second, divergent notion of run membership next to the Phase 15 evidence chain.
+    ``list_for_run`` is now a plain indexed ``WHERE run_id = %s``.
+
+    ``input_context_ref`` is still written and still meaningful: it names the context
+    the agent was given, which a run id does not carry. It is no longer the run filter.
     """
 
     def insert(self, analysis: AiAnalysis) -> dict:
@@ -724,6 +727,10 @@ class AiAnalysisRepository(BaseRepository):
             "ai_analysis",
             {
                 "id": analysis.id,
+                # The real run that owns this analysis. ``NULL`` is accepted by the
+                # column but rejected by ``ai_analysis_run_id_required_check`` for any
+                # new write, so a Phase 17 row is always run-scoped.
+                "run_id": analysis.run_id,
                 "agent_name": analysis.agent_name,
                 "model_used": analysis.model_used,
                 "input_context_ref": analysis.input_context_ref,
@@ -734,13 +741,25 @@ class AiAnalysisRepository(BaseRepository):
             },
         )
 
-    def list_all(self) -> list[dict]:
-        """All analysis rows in stable id order.
+    def list_for_run(self, run_id) -> list[dict]:
+        """Analysis rows belonging to ``run_id``.
 
-        Deliberately not run-scoped: the table has no ``run_id`` column to scope by, and
-        inventing a ``LIKE`` over ``input_context_ref`` here would be a second, divergent
-        notion of run membership next to the Phase 15 evidence chain. Callers that need a
-        run's rows filter ``input_context_ref`` themselves, where the format is documented.
+        The primary run-scoped read. It is qualified by ``run_id`` alone -- never by
+        ``input_context_ref`` -- so an unattributable legacy row (``run_id IS NULL``)
+        cannot surface as this run's analysis, and no text prefix is involved.
+        """
+        return self._fetch_all(
+            "SELECT * FROM ai_analysis WHERE run_id = %s ORDER BY created_at, id",
+            (run_id,),
+        )
+
+    def list_all(self) -> list[dict]:
+        """Every analysis row, in stable id order -- including unattributed ones.
+
+        Deliberately not run-scoped, and deliberately not the production read: it spans
+        every run in the database and cannot answer "what did the AI propose for *this*
+        run". It exists for migration/backfill verification and internal auditing, and is
+        not reachable from the run-scoped API.
         """
         return self._fetch_all("SELECT * FROM ai_analysis ORDER BY id")
 
@@ -1142,6 +1161,7 @@ class Repositories(Storage):
         row = self.ai_analysis.insert(analysis)
         return AiAnalysis(
             id=row["id"],
+            run_id=row.get("run_id"),
             agent_name=row["agent_name"],
             model_used=row["model_used"],
             input_context_ref=row["input_context_ref"],
@@ -1149,21 +1169,35 @@ class Repositories(Storage):
             created_at=row.get("created_at"),
         )
 
-    def list_ai_analysis(self) -> list[AiAnalysis]:
-        """Every recorded agent invocation, in stable id order.
+    def list_ai_analysis(self, run_id: Optional[UUID] = None) -> list[AiAnalysis]:
+        """Recorded agent invocations, run-scoped by default.
 
-        Not run-scoped: the table has no ``run_id`` column (see
-        :class:`AiAnalysisRepository`). The Phase 16 hook writes ``run_id`` into
-        ``input_context_ref``, so a caller filtering to one run matches on that prefix.
+        ``list_ai_analysis(run_id)`` is the production read: an indexed
+        ``WHERE run_id = %s`` (:meth:`AiAnalysisRepository.list_for_run`), which is what
+        the Phase 17 API route and report use.
+
+        ``run_id`` is optional and defaults to ``None`` only for the migration/backfill
+        audit path, which needs to see rows -- including unattributable legacy rows with
+        ``run_id IS NULL`` -- across every run. Callers that pass nothing therefore get
+        the *unfiltered* set, which is why the run-scoped API always passes a run id and
+        no operator-reachable surface exposes the unfiltered result.
         """
+        rows = (
+            self.ai_analysis.list_all()
+            if run_id is None
+            else self.ai_analysis.list_for_run(run_id)
+        )
         return [
             AiAnalysis(
                 id=row["id"],
+                # A legacy row that migration 0005 could not attribute reports NULL here
+                # rather than a fabricated run.
+                run_id=row.get("run_id"),
                 agent_name=row["agent_name"],
                 model_used=row["model_used"],
                 input_context_ref=row["input_context_ref"],
                 output=row["output"] or {},
                 created_at=row.get("created_at"),
             )
-            for row in self.ai_analysis.list_all()
+            for row in rows
         ]

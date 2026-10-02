@@ -47,6 +47,8 @@ ai:
   mode: hybrid                 # local | cloud | hybrid
   local_model: ...
   cloud_model: ...
+  enabled: false               # Phase 16: wire an AnalysisHook at all (default off)
+  max_loop_passes: 32          # Phase 17: adaptive-loop instability/safety budget
 
 limits:
   requests_per_second: ...
@@ -74,6 +76,8 @@ outputs:
 | `api` | `rest` / `openapi` / `swagger` / `graphql` / `websocket` / `authentication_analysis` | Toggle each API-recon capability independently |
 | `ai` | `mode` | Force `local`, force `cloud`, or let the router choose (`hybrid`) |
 | `ai` | `local_model` / `cloud_model` | Model identifiers used by `ai/router.py` |
+| `ai` | `enabled` | Wire an `AnalysisHook` into the served orchestrator. Default `false`: with no hook the run walks the deterministic Phase 15 path to `COMPLETED`. |
+| `ai` | `max_loop_passes` | Instability/safety budget on the adaptive loop (default `32`). Reaching it ends the run as `CANCELLED` rather than looping (`01_PRODUCT_SPEC.md` §10). Must be a whole number `> 0`. |
 | `limits` | `requests_per_second` / `concurrency` | Global Rate Limiter defaults (per-program overrides may still apply) |
 | `outputs` | `json` / `markdown` / `html` | Toggle which report formats are generated |
 
@@ -82,3 +86,12 @@ outputs:
 Secrets (database credentials, cloud model API keys, etc.) must never be committed to Git. Use
 environment variables or a secure secrets mechanism, and reference them by name in this
 configuration file rather than by value.
+
+## Why `ai.max_loop_passes` is process-level, not per-run
+
+`runs.configuration_snapshot` records the configuration a run was created with so a later process
+reproduces the same run. `max_loop_passes` does not belong there: the adaptive loop's budget is
+fixed when the orchestrator is composed and is identical for every run in that process, so a
+per-run snapshot value would be recorded and then ignored by the run it describes. It is reported
+in `Config.to_dict()` (the full effective configuration) and deliberately excluded from
+`run_snapshot_from_dict()`. `ai.enabled` is treated the same way, for the same reason.
