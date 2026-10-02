@@ -40,6 +40,7 @@ from recon.ingest import (
     KIND_IP,
 )
 from database.models.entities import (
+    AiAnalysis,
     Asset,
     AssetIp,
     DnsRecord,
@@ -704,6 +705,46 @@ class AssetTechnologyRepository(BaseRepository):
         )
 
 
+class AiAnalysisRepository(BaseRepository):
+    """Canonical ``ai_analysis`` table access (05_DATA_MODEL.md, Phase 16).
+
+    One row per agent invocation. The table predates Phase 16 (migration 0001) but had no
+    entity and no repository, so it was unreachable: nothing in production could record
+    that the intelligence layer had run at all.
+
+    ``ai_analysis`` has **no ``run_id`` column** -- only ``agent_name``/``model_used``/
+    ``input_context_ref``/``output``/``created_at``. Run attribution is therefore carried in
+    ``input_context_ref`` rather than a foreign key, and is recorded there in a documented,
+    parseable form by :mod:`ai.loop`. That is a schema limitation to record, not to migrate
+    around here; it is called out in ``PHASE_16_PROPOSAL.md`` §3.2.
+    """
+
+    def insert(self, analysis: AiAnalysis) -> dict:
+        return self._insert(
+            "ai_analysis",
+            {
+                "id": analysis.id,
+                "agent_name": analysis.agent_name,
+                "model_used": analysis.model_used,
+                "input_context_ref": analysis.input_context_ref,
+                # The full Common Output Contract object, including the ``evidence`` array
+                # that cites this run's evidence ids. ``hypotheses`` has no column for
+                # those ids, so this jsonb is the only place they survive.
+                "output": psycopg.types.json.Jsonb(analysis.output or {}),
+            },
+        )
+
+    def list_all(self) -> list[dict]:
+        """All analysis rows in stable id order.
+
+        Deliberately not run-scoped: the table has no ``run_id`` column to scope by, and
+        inventing a ``LIKE`` over ``input_context_ref`` here would be a second, divergent
+        notion of run membership next to the Phase 15 evidence chain. Callers that need a
+        run's rows filter ``input_context_ref`` themselves, where the format is documented.
+        """
+        return self._fetch_all("SELECT * FROM ai_analysis ORDER BY id")
+
+
 class HypothesisRepository(BaseRepository):
     """Canonical ``hypotheses`` table access (05_DATA_MODEL.md).
 
@@ -790,6 +831,7 @@ class Repositories(Storage):
         self.evidence = EvidenceRepository(conn)
         self.technologies = TechnologyRepository(conn)
         self.asset_technologies = AssetTechnologyRepository(conn)
+        self.ai_analysis = AiAnalysisRepository(conn)
         self.hypotheses = HypothesisRepository(conn)
 
     # -- core.orchestrator.Storage contract ----------------------------------
@@ -1087,3 +1129,41 @@ class Repositories(Storage):
             ),
         )
         return serialize(project(run_id, facts))
+
+    # -- Phase 16: AI-analysis audit records ------------------------------------
+    #
+    # Additive to the ``Storage`` contract, duck-typed by the caller exactly like
+    # ``attack_surface``. The Phase 16 hook writes through these two; nothing else in the
+    # system creates an ``ai_analysis`` row, which is the point -- it is the audit trail of
+    # the intelligence layer, not a side effect of anything else.
+
+    def insert_ai_analysis(self, analysis: AiAnalysis) -> AiAnalysis:
+        """Record one agent invocation and its structured output."""
+        row = self.ai_analysis.insert(analysis)
+        return AiAnalysis(
+            id=row["id"],
+            agent_name=row["agent_name"],
+            model_used=row["model_used"],
+            input_context_ref=row["input_context_ref"],
+            output=row["output"] or {},
+            created_at=row.get("created_at"),
+        )
+
+    def list_ai_analysis(self) -> list[AiAnalysis]:
+        """Every recorded agent invocation, in stable id order.
+
+        Not run-scoped: the table has no ``run_id`` column (see
+        :class:`AiAnalysisRepository`). The Phase 16 hook writes ``run_id`` into
+        ``input_context_ref``, so a caller filtering to one run matches on that prefix.
+        """
+        return [
+            AiAnalysis(
+                id=row["id"],
+                agent_name=row["agent_name"],
+                model_used=row["model_used"],
+                input_context_ref=row["input_context_ref"],
+                output=row["output"] or {},
+                created_at=row.get("created_at"),
+            )
+            for row in self.ai_analysis.list_all()
+        ]

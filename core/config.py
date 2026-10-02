@@ -219,9 +219,27 @@ class ApiConfig:
 
 @dataclass(frozen=True)
 class AiConfig:
+    """AI/intelligence-layer settings (``14_CONFIG_EXAMPLE.md`` ``ai.*``).
+
+    ``enabled`` (Phase 16) defaults to **False**. It is the single switch that decides whether
+    ``create_serve_app`` passes an ``analysis=`` hook to the ``Orchestrator``, and therefore
+    whether the adaptive loop runs at all. Defaulting it off means:
+
+    * the loop cannot be turned on by accident, by an omitted key, or by a config default;
+    * with it off, ``analysis`` stays ``None`` and the run walks straight to ``COMPLETED`` --
+      byte-identical to Phase 15 behaviour;
+    * a deployment can adopt the intelligence layer deliberately, per-environment, instead of
+      inheriting it from whatever the defaults happen to be.
+
+    ``mode``/``local_model``/``cloud_model`` remain the Phase-6 routing configuration. Phase 16
+    makes no model call, so they are recorded on each ``ai_analysis`` row rather than used to
+    select a provider; Phase 17 consumes them at that seam.
+    """
+
     mode: AiMode = AiMode.HYBRID
     local_model: str = ""
     cloud_model: str = ""
+    enabled: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "AiConfig":
@@ -238,6 +256,7 @@ class AiConfig:
             mode=mode,
             local_model=str(data.get("local_model") or ""),
             cloud_model=str(data.get("cloud_model") or ""),
+            enabled=bool(data.get("enabled", False)),
         )
 
 
@@ -378,6 +397,7 @@ class Config:
                 "mode": self.ai.mode.value,
                 "local_model": self.ai.local_model,
                 "cloud_model": self.ai.cloud_model,
+                "enabled": self.ai.enabled,
             },
             "limits": {
                 "requests_per_second": self.limits.requests_per_second,

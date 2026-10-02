@@ -2,13 +2,17 @@
 
 Maps the ``05_DATA_MODEL.md`` tables that Milestone 1 touches: organizations,
 programs, runs, scope_rules, assets, dns_records, ips, asset_ips, ports, web_apps,
-tasks, tool_runs, evidence, hypotheses.
+tasks, tool_runs, evidence, ai_analysis, hypotheses.
 
 ``Hypothesis`` is the canonical persistent hypothesis record backing the
 ``hypotheses`` table. It is distinct from the AI-layer ``ai.context.HypothesisRecord``,
 which is an immutable agent input/output DTO and never persisted directly. Analytical
 state (``truth_label`` / ``status``) and operator review state
 (``review_status`` / ``review_reason``) are stored independently.
+
+``AiAnalysis`` is distinct from both: it is the audit record of one agent
+invocation (Phase 16), and it is where the evidence ids a proposal cited are
+preserved, because ``hypotheses`` has no column for them.
 """
 
 from __future__ import annotations
@@ -157,6 +161,29 @@ class Evidence:
     entity_type: str = ""
     entity_id: Optional[UUID] = None
     raw_reference: Optional[str] = None
+
+
+@dataclass
+class AiAnalysis:
+    """One agent invocation and its structured output (``ai_analysis`` table).
+
+    This is the Phase-16 record of *what the intelligence layer actually did*: which agent
+    ran, which model the Phase-6 router selected, a reference to the context it was given,
+    and the full Common Output Contract object it emitted.
+
+    It exists because ``hypotheses`` cannot carry that. The table has no ``evidence_id``
+    column, so the ``evidence`` array every proposal must cite (``07_AI_AGENTS.md`` "AI
+    Safety Boundary") has nowhere to live on the hypothesis row itself. The cited ids are
+    preserved here in ``output`` instead, which is why a hypothesis is only trustworthy
+    when the ``ai_analysis`` row that produced it is retained alongside it.
+    """
+
+    id: UUID = field(default_factory=_uuid)
+    agent_name: str = ""
+    model_used: str = ""
+    input_context_ref: Optional[str] = None
+    output: dict = field(default_factory=dict)
+    created_at: Optional[datetime] = None
 
 
 @dataclass

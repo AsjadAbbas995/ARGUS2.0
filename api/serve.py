@@ -456,11 +456,31 @@ def create_serve_app(
     # persists them inside the orchestrator's transaction. Both are additive: a
     # run with no artifacts ingests nothing, and every other caller of
     # ``ServedExecution`` still gets a bare ``ToolRun`` from ``__call__``.
+    # Phase 16: the adaptive loop. ``analysis`` stays ``None`` unless ``ai.enabled`` is set,
+    # so a deployment that never opted in keeps the exact Phase 15 walk (execute the planned
+    # tasks, then COMPLETE). The hook is given the live adapter registry rather than a
+    # hardcoded list, so it can never propose a task type this server would refuse.
+    analysis = None
+    if getattr(effective_config.ai, "enabled", False):
+        from ai.loop import build_analysis_hook
+        from ai.router import RouteConfig as AiRouteConfig
+
+        analysis = build_analysis_hook(
+            store,
+            execution.known_task_types(),
+            route_config=AiRouteConfig(
+                mode=effective_config.ai.mode.value,
+                local_model=effective_config.ai.local_model or "local",
+                cloud_model=effective_config.ai.cloud_model or "cloud",
+            ),
+        )
+
     orch = Orchestrator(
         storage=store,
         run_tool=execution.run,
         rate_limiter=limiter,
         ingest=_build_ingestor(store, effective_config),
+        analysis=analysis,
     )
 
     app = create_app(orch, api_key=effective_key)
