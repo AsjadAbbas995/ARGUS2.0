@@ -329,7 +329,11 @@ def test_0005_reverts_and_can_be_reapplied(schema, store, legacy):
     assert {a.agent_name for a in store.list_ai_analysis()} == {
         "attributable", "non_canonical", "missing_run", "no_ref", "other_shape",
     }
-    assert apply(schema) == [5]
+    # Re-applying from version 4 re-runs every migration above it, so the expectation is
+    # the whole pending chain -- ``0005`` plus the later ``0006`` (Phase 18 coverage gaps)
+    # -- not just ``0005``. The migration behavior is unchanged; only the stale
+    # expectation is updated to track the chain that now exists.
+    assert apply(schema) == [5, 6]
     assert "run_id" in _columns(schema)
 
 
