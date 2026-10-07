@@ -49,8 +49,11 @@ from core.tool_runner import ToolRunner, ToolRunnerError
 from database.models.entities import ToolRun
 from recon.base import ToolAdapter
 from recon.dns.resolver import DnsResolverAdapter, make_resolver
+from recon.expansion import plan_discovery_expansion
 from recon.ingest import plan_ingestion
 from recon.normalize import normalize_hostname
+from recon.ports.nmap import NmapAdapter
+from recon.subdomains.subfinder import SubfinderAdapter
 from recon.web.httpx_probe import HttpxProbeAdapter
 
 log = logging.getLogger(__name__)
@@ -71,6 +74,13 @@ API_KEY_ENV = "ARGUS_API_KEY"
 #: :class:`UnknownTaskType`.
 DEFAULT_ADAPTER_TYPES: tuple[str, ...] = ("dns_resolve", "dns", "resolve")
 DEFAULT_HTTP_PROBE_TYPES: tuple[str, ...] = ("http_probe", "httpx", "web_probe")
+#: Phase 20A breadth. ``subdomain_enum`` is the stage name the AI layer already
+#: reports (``ai.run_context.TASK_TYPE_COVERS_STAGE``), so it is registered to the
+#: same Subfinder adapter as ``subfinder``; likewise ``port_scan`` and ``nmap``
+#: both dispatch to Nmap. Registering both spellings keeps the served registry and
+#: the AI coverage computation consistent instead of reopening a covered gap.
+DEFAULT_SUBFINDER_TYPES: tuple[str, ...] = ("subfinder", "subdomain_enum")
+DEFAULT_PORT_SCAN_TYPES: tuple[str, ...] = ("port_scan", "nmap")
 
 
 class ServeConfigurationError(RuntimeError):
@@ -314,6 +324,15 @@ def _default_adapters(
     adapters.update(
         {kind: HttpxProbeAdapter for kind in DEFAULT_HTTP_PROBE_TYPES}
     )
+    # Phase 20A: passive subdomain discovery and TCP port discovery. Both are
+    # ordinary adapters on the documented execution chain; nothing about AI or
+    # scope changes here.
+    adapters.update(
+        {kind: SubfinderAdapter for kind in DEFAULT_SUBFINDER_TYPES}
+    )
+    adapters.update(
+        {kind: NmapAdapter for kind in DEFAULT_PORT_SCAN_TYPES}
+    )
     return adapters
 
 
@@ -321,7 +340,9 @@ def _default_adapters(
 _INGEST_METHOD = "ingest_observations"
 
 
-def _build_ingestor(store, config: Config) -> Optional[Callable[..., None]]:
+def _build_ingestor(
+    store, config: Config, available_types: tuple[str, ...] = ()
+) -> Optional[Callable[..., None]]:
     """Build the Phase-14 ingestion callback for a served orchestrator.
 
     Returns ``None`` when the storage cannot persist facts (e.g. ``MemoryStorage``),
@@ -329,6 +350,12 @@ def _build_ingestor(store, config: Config) -> Optional[Callable[..., None]]:
     method that does not exist. The returned callable runs *inside* the
     orchestrator's transaction, so everything it writes commits or rolls back
     together with the ``ToolRun`` and the task's terminal state.
+
+    Phase 20A: after the facts are persisted, the same callback enqueues any child
+    tasks the artifacts imply (``recon.expansion``) so a discovery result feeds the
+    next piece of reconnaissance on the following scheduling pass. ``available_types``
+    is the composition's own registry, so expansion can never propose a task this
+    server would refuse.
     """
     if not callable(getattr(store, _INGEST_METHOD, None)):
         return None
@@ -377,8 +404,83 @@ def _build_ingestor(store, config: Config) -> Optional[Callable[..., None]]:
             raw_output_ref=tool_run.raw_output_ref,
             program_id=run.program_id,
         )
+        _enqueue_expansion(
+            store,
+            available_types=available_types,
+            task=task,
+            artifacts=artifacts,
+            run=run,
+            scope=scope,
+        )
 
     return ingest
+
+
+def _enqueue_expansion(
+    store,
+    *,
+    available_types: tuple[str, ...],
+    task,
+    artifacts,
+    run,
+    scope,
+) -> None:
+    """Enqueue scope-checked child tasks for a completed discovery task.
+
+    Runs inside the ingest callback (and therefore the orchestrator's transaction).
+    A child whose fingerprint is already known to this run is never re-inserted, so
+    a resumed or re-executed parent cannot duplicate work. Failures here must not
+    break ingestion: they are logged and the run continues with no expansion.
+    """
+    if not available_types or not artifacts:
+        return
+    if scope is None:
+        # An unscoped run cannot verify a discovered destination; do not expand.
+        return
+    insert_tasks = getattr(store, "insert_tasks", None)
+    list_tasks = getattr(store, "list_tasks", None)
+    if not callable(insert_tasks) or not callable(list_tasks):
+        return
+    try:
+        known_tasks = list_tasks(run.id)
+        # A resolved host only deepens into a port scan when it came from a
+        # discovery chain, so the planner learns the completing task's own parent's
+        # type (``ancestor_type``). Root/user-requested DNS keeps its narrow
+        # contract: exactly the enqueued tasks run, no scan is injected.
+        parent_types = {
+            getattr(t, "id", None): getattr(t, "type", None) for t in known_tasks
+        }
+        children = plan_discovery_expansion(
+            artifacts,
+            parent=task,
+            scope=scope,
+            available_types=available_types,
+            config=run.configuration_snapshot or {},
+            ancestor_type=parent_types.get(getattr(task, "parent_task_id", None)),
+        )
+        if not children:
+            return
+        known = {
+            t.fingerprint
+            for t in known_tasks
+            if getattr(t, "fingerprint", None)
+        }
+        fresh: list = []
+        for child in children:
+            fingerprint = getattr(child, "fingerprint", "")
+            if not fingerprint or fingerprint in known:
+                continue
+            known.add(fingerprint)
+            fresh.append(child)
+        if fresh:
+            insert_tasks(fresh)
+            log.info(
+                "expansion: enqueued %d child task(s) from task %s",
+                len(fresh),
+                task.id,
+            )
+    except Exception as exc:  # noqa: BLE001 - expansion must not wedge ingestion
+        log.warning("expansion for task %s failed: %s", task.id, exc)
 
 
 def create_serve_app(
@@ -487,7 +589,9 @@ def create_serve_app(
         storage=store,
         run_tool=execution.run,
         rate_limiter=limiter,
-        ingest=_build_ingestor(store, effective_config),
+        ingest=_build_ingestor(
+            store, effective_config, execution.known_task_types()
+        ),
         analysis=analysis,
         # Phase 17: the loop budget is served policy, not a hardcoded dataclass default. The
         # default is unchanged (32), so a deployment that configures nothing behaves exactly as

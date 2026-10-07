@@ -1029,6 +1029,29 @@ class Repositories(Storage):
             )
             _evidence(ENTITY_WEB_APP, app["id"])
 
+        for port in plan.ports:
+            # Phase 20A: a directly observed port. The IP is the port's
+            # authoritative discovery surface (``ports.ip_id`` is NOT NULL), so it
+            # is upserted first; the asset link is added only when the port was
+            # reached through an in-scope hostname and that asset was recorded.
+            ip = self.ips.upsert(port.address)
+            _evidence(ENTITY_IP, ip["id"])
+            asset_id = asset_ids.get(port.host) if port.host else None
+            if asset_id is not None:
+                self.asset_ips.upsert(asset_id, ip["id"])
+                _evidence(ENTITY_ASSET_IP)
+            port_row = self.ports.upsert(
+                Port(
+                    ip_id=ip["id"],
+                    port_number=port.port_number,
+                    protocol=port.protocol,
+                    state=port.state,
+                    service=port.service or None,
+                    version=port.version or None,
+                )
+            )
+            _evidence(ENTITY_PORT, port_row["id"])
+
         for link in plan.technologies:
             asset_id = asset_ids.get(link.hostname)
             if asset_id is None:

@@ -18,6 +18,7 @@ from recon.ingest import (
     OBSERVED_TECHNOLOGY_CONFIDENCE,
     plan_ingestion,
 )
+from recon.ports.nmap import PortObservation
 from recon.web.httpx_probe import (
     AssetTechnologyObservation,
     TechnologyObservation,
@@ -110,6 +111,88 @@ def test_technology_defaults_category_and_confidence() -> None:
     tech = result.technologies[0]
     assert tech.category == DEFAULT_TECHNOLOGY_CATEGORY
     assert tech.confidence == OBSERVED_TECHNOLOGY_CONFIDENCE
+
+
+# -- ports (Phase 20A) --------------------------------------------------------
+
+
+def test_port_observation_maps_to_a_port_plan() -> None:
+    result = plan(
+        [
+            PortObservation(
+                address="203.0.113.12",
+                port=443,
+                protocol="tcp",
+                state="open",
+                service="https",
+                version="nginx 1.25.1",
+            )
+        ]
+    )
+    assert len(result.ports) == 1
+    port = result.ports[0]
+    assert (port.address, port.port_number, port.protocol, port.state) == (
+        "203.0.113.12",
+        443,
+        "tcp",
+        "open",
+    )
+    assert (port.service, port.version) == ("https", "nginx 1.25.1")
+    assert port.host == ""  # no hostname on the observation -> no asset link
+
+
+def test_port_with_host_links_the_asset_but_never_invents_one() -> None:
+    result = plan(
+        [
+            PortObservation(
+                address="203.0.113.12",
+                port=80,
+                host="www.example.com",
+            )
+        ]
+    )
+    assert [a.hostname for a in result.assets] == ["www.example.com"]
+    assert result.ports[0].host == "www.example.com"
+
+
+def test_port_for_out_of_scope_ip_is_observed_not_promoted() -> None:
+    result = plan([PortObservation(address="198.51.100.9", port=443)])
+    assert result.ports == ()
+    assert [(o.kind, o.value) for o in result.out_of_scope] == [
+        (KIND_IP, "198.51.100.9")
+    ]
+
+
+def test_port_for_a_denied_host_is_not_promoted() -> None:
+    result = plan(
+        [
+            PortObservation(
+                address="203.0.113.12", port=443, host="internal.example.com"
+            )
+        ]
+    )
+    # The IP is in scope but the host is excluded: no fact may be keyed to it.
+    assert result.ports == ()
+    assert [o.value for o in result.out_of_scope] == ["internal.example.com"]
+
+
+def test_duplicate_port_observations_collapse() -> None:
+    result = plan(
+        [
+            PortObservation(address="203.0.113.12", port=443, protocol="tcp"),
+            PortObservation(address="203.0.113.12", port=443, protocol="tcp"),
+            PortObservation(address="203.0.113.12", port=443, protocol="udp"),
+        ]
+    )
+    assert [(p.address, p.port_number, p.protocol) for p in result.ports] == [
+        ("203.0.113.12", 443, "tcp"),
+        ("203.0.113.12", 443, "udp"),
+    ]
+
+
+def test_port_makes_a_plan_non_empty() -> None:
+    result = plan([PortObservation(address="203.0.113.12", port=443)])
+    assert result.is_empty is False
 
 
 # -- normalization ----------------------------------------------------------

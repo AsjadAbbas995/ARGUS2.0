@@ -478,10 +478,14 @@ class TestServedComposition:
 
     def test_the_gate_excludes_every_stage_without_an_adapter(self):
         orch = _served_orchestrator(True)
-        # The served registry only has DNS + HTTP adapters, so the stages that need one of the
-        # missing adapters must not be translatable into a runnable task type.
+        # Phase 20A registered Subfinder and Nmap adapters, so every stage with a
+        # served adapter is translatable into a runnable task type. Only the stages
+        # that still lack an adapter (``tech_detect``) must not be runnable.
+        covered = frozenset(
+            {"dns_resolve", "http_probe", "subdomain_enum", "port_scan"}
+        )
         for stage, task_type in ai_loop.TASK_TYPE_FOR_STAGE.items():
-            if stage in ("dns_resolve", "http_probe"):
+            if stage in covered:
                 continue
             assert task_type not in orch.analysis.runnable, stage
 

@@ -28,6 +28,7 @@ from typing import Any, Optional, Sequence
 from core.scope_guard import ScopeGuard
 from recon.dns.resolver import DnsRecordObservation, IpObservation
 from recon.normalize import normalize_hostname
+from recon.ports.nmap import PortObservation
 from recon.web.httpx_probe import (
     AssetTechnologyObservation,
     TechnologyObservation,
@@ -113,6 +114,26 @@ class TechnologyLinkPlan:
 
 
 @dataclass(frozen=True)
+class PortPlan:
+    """A standalone ``ports`` row observed by port discovery (Phase 20A).
+
+    Unlike a web app's implicit port, this port was observed directly. ``address``
+    is the in-scope IP the port belongs to (its own discovery surface, so it is
+    scope-checked independently). ``host`` is the hostname the port was discovered
+    through, when the task target was a name rather than a bare address; it is used
+    to link the IP to the asset, and is empty otherwise.
+    """
+
+    address: str
+    port_number: int
+    protocol: str = "tcp"
+    state: str = "open"
+    service: str = ""
+    version: str = ""
+    host: str = ""
+
+
+@dataclass(frozen=True)
 class OutOfScopeObservation:
     """A discovered host/IP the run's scope rejects: evidence only, never a row."""
 
@@ -135,6 +156,7 @@ class IngestionPlan:
     ip_links: tuple[IpLinkPlan, ...] = ()
     web_apps: tuple[WebAppPlan, ...] = ()
     technologies: tuple[TechnologyLinkPlan, ...] = ()
+    ports: tuple[PortPlan, ...] = ()
     out_of_scope: tuple[OutOfScopeObservation, ...] = ()
     unrecognized: int = 0
     truncated: int = 0
@@ -148,6 +170,7 @@ class IngestionPlan:
             or self.ip_links
             or self.web_apps
             or self.technologies
+            or self.ports
             or self.out_of_scope
         )
 
@@ -195,6 +218,8 @@ def plan_ingestion(
     seen_web: set[tuple[str, int]] = set()
     technologies: list[TechnologyLinkPlan] = []
     seen_tech: set[tuple[str, str]] = set()
+    ports: list[PortPlan] = []
+    seen_ports: set[tuple[str, int, str]] = set()
     unrecognized = 0
 
     def check(kind: str, value: str) -> bool:
@@ -285,6 +310,32 @@ def plan_ingestion(
                     technologies.append(
                         TechnologyLinkPlan(hostname=host, name=artifact.name)
                     )
+        elif isinstance(artifact, PortObservation):
+            # A port's authoritative discovery surface is its IP
+            # (``04_SCOPE_SAFETY.md``): the address is checked independently of any
+            # hostname. When the port was reached through a hostname, the host must
+            # also pass scope before a fact is keyed to it -- a fact is never
+            # attributed to a denied host.
+            address = (artifact.address or "").strip()
+            if not address or not check(KIND_IP, address):
+                continue
+            host = classify_host(artifact.host) if artifact.host else None
+            if artifact.host and host is None:
+                continue
+            key = (address, artifact.port, artifact.protocol)
+            if key not in seen_ports:
+                seen_ports.add(key)
+                ports.append(
+                    PortPlan(
+                        address=address,
+                        port_number=artifact.port,
+                        protocol=artifact.protocol,
+                        state=artifact.state,
+                        service=artifact.service,
+                        version=artifact.version,
+                        host=host or "",
+                    )
+                )
         else:
             unrecognized += 1
 
@@ -294,6 +345,7 @@ def plan_ingestion(
         ip_links=tuple(ip_links),
         web_apps=tuple(web_apps),
         technologies=tuple(technologies),
+        ports=tuple(ports),
         out_of_scope=tuple(out_of_scope.values()),
         unrecognized=unrecognized,
         truncated=truncated,
