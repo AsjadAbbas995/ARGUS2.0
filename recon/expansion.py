@@ -20,6 +20,10 @@ Safety rules, all enforced here *before* a task can be proposed:
 * Only task types already registered by the composition are proposed
   (``available_types`` allowlist), so expansion can never invent a task the
   server would refuse.
+* A discovered web application warrants two children: a ``tech_detect`` for
+  technology fingerprinting and, when crawling is enabled (``web.crawling`` in
+  the run's configuration, default true) and ``web_crawl``/``katana`` is
+  registered, a deterministic crawl whose seed is the app's own recorded URL.
 * The output is bounded (``max_tasks``) and sorted by ``(type, target)`` so the
   same artifacts always propose the same children in the same order.
 * No exploit, credential, brute-force, or scope-expanding behavior is expressed
@@ -28,6 +32,7 @@ Safety rules, all enforced here *before* a task can be proposed:
 
 from __future__ import annotations
 
+import json
 from typing import Any, Iterable, Optional, Sequence
 
 from core.scope_guard import ScopeGuard, extract_host
@@ -36,12 +41,15 @@ from database.models.entities import Task
 from recon.dns.resolver import IpObservation
 from recon.normalize import normalize_hostname
 from recon.ports.nmap import PortObservation
+from recon.web.httpx_probe import WebAppObservation
 
 #: Task types this module may propose, keyed by the trigger artifact. The actual
 #: emission is still filtered by the caller's ``available_types`` allowlist.
 CHILD_TYPE_DNS = "dns_resolve"
 CHILD_TYPE_PORT_SCAN = "port_scan"
 CHILD_TYPE_HTTP_PROBE = "http_probe"
+CHILD_TYPE_TECH_DETECT = "tech_detect"
+CHILD_TYPE_WEB_CRAWL = "web_crawl"
 
 #: Ports worth an HTTP probe. Deliberately conservative: a full "anything that
 #: might speak HTTP" list would fan out; these are the conventional clear-text and
@@ -57,6 +65,52 @@ WEB_PORTS: frozenset[int] = frozenset({80, 443, 8000, 8008, 8080, 8081, 8443, 88
 DISCOVERY_TASK_TYPES: frozenset[str] = frozenset({"subdomain_enum", "subfinder"})
 
 DEFAULT_MAX_TASKS = 256
+
+
+def _tech_detect_reuse_reason(artifact: WebAppObservation) -> Optional[str]:
+    """Package already-captured ``WebAppObservation`` signals for fingerprint reuse.
+
+    The payload mirrors the fields ``WebAppRepository.upsert`` persists in the
+    ``web_apps`` table: ``server_header`` / ``title`` / ``content_type``. Only
+    non-empty signals are admitted; when the probe captured nothing usable, no
+    payload is attached and the ``tech_detect`` task performs its own bounded
+    fetch instead (``06_TOOL_CONTRACTS.md`` §tech_detect "reuse").
+    """
+    payload: dict[str, str] = {}
+    if (artifact.webserver or "").strip():
+        payload["server_header"] = artifact.webserver.strip()
+    if (artifact.title or "").strip():
+        payload["title"] = artifact.title.strip()
+    if (artifact.content_type or "").strip():
+        payload["content_type"] = artifact.content_type.strip()
+    if not payload:
+        return None
+    return json.dumps(payload, sort_keys=True)
+
+
+#: Web-application ports whose probe target doubles as a crawl seed; HTTPS is implied
+#: for the conventional TLS ports. Mirrors the ``Catalog`` decision in §8.
+_CRAWL_HTTPS_PORTS: frozenset[int] = frozenset({443, 8443})
+
+
+def _crawl_seed(artifact: WebAppObservation) -> str:
+    """A crawl seed for the probed application: its recorded URL, else ``scheme://host:port/``.
+
+    ``artifact.url`` is the canonical seed Katana is told to crawl. Guard the fallback
+    (an adapter that never recorded a ``url``): the scheme is chosen deterministically --
+    https for the conventional TLS ports, http otherwise -- so the same probe always
+    yields the same seed.
+    """
+    url = (getattr(artifact, "url", "") or "").strip()
+    if url:
+        return url
+    scheme = "https" if artifact.port in _CRAWL_HTTPS_PORTS else "http"
+    return f"{scheme}://{artifact.host}:{artifact.port}/"
+
+
+def _crawl_reuse_reason(seed: str) -> str:
+    """The seed doubles as the fingerprint-reuse payload (``{"url": seed}``)."""
+    return json.dumps({"url": seed}, sort_keys=True)
 
 
 def plan_discovery_expansion(
@@ -87,16 +141,21 @@ def plan_discovery_expansion(
     parent_host = normalize_hostname(extract_host(getattr(parent, "target", "")))
 
     seen: set[tuple[str, str]] = set()
-    proposals: list[tuple[str, str, Optional[float]]] = []
+    proposals: list[tuple[str, str, Optional[float], Optional[str]]] = []
 
-    def propose(child_type: str, target: str, priority: Optional[float] = None) -> None:
+    def propose(
+        child_type: str,
+        target: str,
+        priority: Optional[float] = None,
+        reason: Optional[str] = None,
+    ) -> None:
         if child_type not in allowed:
             return
         key = (child_type, target)
         if key in seen:
             return
         seen.add(key)
-        proposals.append((child_type, target, priority))
+        proposals.append((child_type, target, priority, reason))
 
     for artifact in artifacts:
         if isinstance(artifact, str):
@@ -128,13 +187,46 @@ def plan_discovery_expansion(
             host = normalize_hostname(artifact.host) or parent_host
             if host and scope.check_host(host).in_scope:
                 propose(CHILD_TYPE_HTTP_PROBE, f"{host}:{artifact.port}")
+        elif isinstance(artifact, WebAppObservation):
+            # A probed web app: fingerprint its technology/WAF/CDN stack. In the
+            # served chain this artifact is produced by the completing ``http_probe``
+            # task and its child hangs off that task, but scope gates everything
+            # regardless of which task type handed it over. The child does its own
+            # bounded work and is permitted to **reuse** already-captured non-empty
+            # signals instead of issuing another request.
+            host = normalize_hostname(artifact.host)
+            if not host or not scope.check_host(host).in_scope:
+                continue
+            if artifact.port not in WEB_PORTS:
+                continue
+            propose(
+                CHILD_TYPE_TECH_DETECT,
+                f"{host}:{artifact.port}",
+                reason=_tech_detect_reuse_reason(artifact),
+            )
+            # Phase 22: crawl the probed app. The canonical child type is ``web_crawl``;
+            # when the composition only registered the ``katana`` spelling, one
+            # katana-typed task is proposed instead (same dedup key, never both).
+            # ``reason`` doubles as the seed-reuse payload the adapter reads back.
+            preferred = allowed & {"web_crawl", "katana"}
+            if preferred and (config or {}).get("web", {}).get("crawling", True):
+                seed = _crawl_seed(artifact)
+                key = (CHILD_TYPE_WEB_CRAWL, seed)
+                if key not in seen:
+                    seen.add(key)
+                    if CHILD_TYPE_WEB_CRAWL in allowed:
+                        proposals.append(
+                            (CHILD_TYPE_WEB_CRAWL, seed, None, _crawl_reuse_reason(seed))
+                        )
+                    elif "katana" in allowed:
+                        proposals.append(("katana", seed, None, _crawl_reuse_reason(seed)))
 
     ordered = sorted(proposals, key=lambda item: (item[0], item[1]))
     limit = max(0, int(max_tasks))
     ordered = ordered[:limit]
 
     children: list[Task] = []
-    for child_type, target, priority in ordered:
+    for child_type, target, priority, reason in ordered:
         fingerprint = task_fingerprint(child_type, target, config, parent)
         children.append(
             Task(
@@ -143,6 +235,7 @@ def plan_discovery_expansion(
                 target=target,
                 parent_task_id=parent.id,
                 priority=priority,
+                reason=reason,
                 fingerprint=fingerprint,
             )
         )

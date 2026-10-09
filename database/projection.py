@@ -20,8 +20,8 @@ Pipeline
 Architecture rule: **read-only**. This module never writes PostgreSQL, never mutates
 evidence, never resolves DNS, never performs HTTP, never invokes a tool or an AI agent,
 never touches scope, and never creates or executes a task. It is a ``SELECT`` composed
-into derived dataclasses that already exist. No new record types, no new inference kinds,
-no change to graph or inference semantics.
+into derived dataclasses that already exist. No new inference kinds, no change to graph
+or inference semantics.
 
 Run scoping -- why evidence, not ownership
 ------------------------------------------
@@ -61,16 +61,22 @@ value. ``PortRecord`` needs its IP and ``WebAppRecord`` needs its port and IP; i
 parents are not run-evidenced the fact is withheld rather than rendered with a fabricated
 linkage. Records with no derivable link that *can* be represented honestly are still
 emitted, landing as orphans -- which is ``03_RECON_PIPELINE.md`` 25's documented failure
-condition ("stored without an edge rather than dropped").
+condition ("stored without an edge rather than dropped"). Phase 22 applies the same rule
+to crawl facts: ``UrlRecord`` needs its web app projected, ``EndpointRecord`` needs its
+URL, ``ParameterRecord`` needs its endpoint, and ``JavaScriptRecord`` needs its web app;
+if the parent is not run-evidenced the fact is withheld, not stitched to a stand-in.
 
 What is deliberately absent
 --------------------------
-Only record types with real persisted producers are projected. Phase 14 has no producer
-for ``urls``, ``endpoints``, ``parameters``, ``javascript_files``, ``apis``,
-``graphql_operations``, ``websocket_endpoints`` or ``auth_mechanisms``, and the schema has
-no ``certificates`` table at all -- so no ``EndpointRecord``, ``ParameterRecord``,
-``AuthRecord``, ``ApiRecord``, ``JavaScriptRecord`` or ``CertificateRecord`` is ever
-created here. Inventing them would fabricate attack surface that was never observed.
+Only record types with real persisted producers are projected. Phase 22 (deterministic
+web crawling) added a producer for ``urls``, ``endpoints``, ``parameters`` and
+``javascript_files``, so records for those are created from their crawled facts. Still
+unproduced -- and therefore never created, because inventing them would fabricate attack
+surface that was never observed -- are ``apis``, ``graphql_operations``,
+``websocket_endpoints`` and ``auth_mechanisms``, and the schema has no ``certificates``
+table at all, so no ``ApiRecord``, ``AuthRecord`` or ``CertificateRecord`` is ever
+created here. Those five kinds remain listed in ``UNPRODUCED_RECORD_KINDS`` so the API
+payload keeps telling "no producers yet" from "nothing was found".
 
 ``dns_records`` has a real producer and run evidence, but the committed correlation model
 has **no** record type for it, and adding one is out of scope. An address-valued DNS
@@ -99,29 +105,42 @@ from correlation.asset_graph import build as build_graph
 from correlation.endpoint_graph import ENDPOINT_KINDS, endpoint_subgraph
 from correlation.records import (
     DomainRecord,
+    EndpointRecord,
     Graph,
     IpRecord,
+    JavaScriptRecord,
     Node,
+    ParameterRecord,
     PortRecord,
     TechnologyRecord,
+    UrlRecord,
     WebAppRecord,
+    endpoint_key,
 )
 from correlation.relationship_engine import Inference
 from correlation.relationship_engine import run as run_relationship_engine
 from recon.ingest import (
     ENTITY_ASSET,
     ENTITY_DNS_RECORD,
+    ENTITY_ENDPOINT,
     ENTITY_IP,
+    ENTITY_JAVASCRIPT,
+    ENTITY_PARAMETER,
     ENTITY_PORT,
     ENTITY_TECHNOLOGY,
+    ENTITY_URL,
     ENTITY_WEB_APP,
 )
 
-#: Entity types that denote a canonical graph node. These are exactly the Phase 14
-#: evidence tags written with a non-NULL ``entity_id``. Everything else Phase 14 writes
-#: (``asset_ip``/``asset_technology`` edges, ``observed_host``/``observed_ip``/
+#: Entity types that denote a canonical graph node. This is the Phase 14 producer set,
+#: pinned by test so a new tag cannot silently stop projecting. Everything else Phase 14
+#: writes (``asset_ip``/``asset_technology`` edges, ``observed_host``/``observed_ip``/
 #: ``observed_web_app`` out-of-scope observations, ``artifact_cap``) has no canonical
-#: entity and can never become a graph node.
+#: entity and can never become a graph node. Phase 22's crawl tags (``url``/``endpoint``/
+#: ``parameter``/``javascript``) also name canonical entities with a non-NULL ``entity_id``
+#: when rooted; they are intentionally absent here -- their records are built in the
+#: dedicated crawl sections below, not as Phase 14 producers, and this tuple drives the
+#: report's asset-counts section only.
 CANONICAL_ENTITY_TYPES: tuple[str, ...] = (
     ENTITY_ASSET,
     ENTITY_IP,
@@ -133,13 +152,12 @@ CANONICAL_ENTITY_TYPES: tuple[str, ...] = (
 
 #: Records whose absence is a known, deliberate gap rather than a bug. Surfaced in the
 #: API payload so an operator can tell "no producers yet" from "nothing was found".
+#: Phase 22 (deterministic web crawling) added real crawled producers for
+#: urls/endpoints/parameters/javascript_files, so only the still-unproduced kinds stay.
 UNPRODUCED_RECORD_KINDS: tuple[str, ...] = (
     "api",
     "auth",
     "certificate",
-    "endpoint",
-    "javascript",
-    "parameter",
 )
 
 #: Sentinel for a web application whose ``status_code`` column is NULL. ``WebAppRecord``
@@ -173,6 +191,14 @@ class RunFacts:
     ports: tuple[Mapping[str, Any], ...] = ()
     web_apps: tuple[Mapping[str, Any], ...] = ()
     technologies: tuple[Mapping[str, Any], ...] = ()
+    #: Phase 22 crawl facts, batch-read by the ids this run's evidence names. Bounds are
+    #: deliberately loose -- plain dict rows like every other fact surface, because
+    #: ``urls``/``endpoints``/``parameters``/``javascript_files`` are new tables that the
+    #: committed entity models do not (and need not) define for this read path.
+    urls: tuple[Mapping[str, Any], ...] = ()
+    endpoints: tuple[Mapping[str, Any], ...] = ()
+    parameters: tuple[Mapping[str, Any], ...] = ()
+    javascript_files: tuple[Mapping[str, Any], ...] = ()
     #: ``(asset_id, ip_id)`` pairs, restricted to assets/ips evidenced in this run.
     asset_ips: tuple[Mapping[str, Any], ...] = ()
     #: ``(asset_id, technology_id)`` pairs, restricted to the same.
@@ -330,6 +356,7 @@ def build_records(facts: RunFacts) -> tuple[Any, ...]:
         )
 
     # -- web apps: require both the port and the asset to be projected -------
+    web_app_records: dict[UUID, WebAppRecord] = {}
     for row in sorted(facts.web_apps, key=lambda r: str(r.get("id"))):
         evidence_id = ref(ENTITY_WEB_APP, row.get("id"))
         port_row = ports.get(row.get("port_id"))
@@ -340,13 +367,102 @@ def build_records(facts: RunFacts) -> tuple[Any, ...]:
         if ip_row is None:
             continue
         status = row.get("status_code")
+        web_app_records[row["id"]] = WebAppRecord(
+            host=str(asset.get("hostname", "")),
+            port=int(port_row.get("port_number") or 0),
+            status_code=int(status) if status is not None else _UNKNOWN_STATUS_CODE,
+            title=str(row.get("title") or ""),
+            ip=str(ip_row.get("address", "")),
+            evidence_id=evidence_id,
+        )
+        records.append(web_app_records[row["id"]])
+
+    # -- crawl URLs: require the web app below to be projected ----------------
+    #
+    # A URL is anchored to its ``web_apps`` row (the graph links it to the web app's
+    # ``host:port`` node). If that app is not itself run-evidenced the URL is withheld;
+    # it is still counted in ``evidence_counts``, so nothing observed is silently lost.
+    url_records: dict[UUID, UrlRecord] = {}
+    for row in sorted(
+        facts.urls,
+        key=lambda r: (str(r.get("path", "")), str(r.get("id"))),
+    ):
+        evidence_id = ref(ENTITY_URL, row.get("id"))
+        web_record = web_app_records.get(row.get("web_app_id"))
+        if evidence_id is None or web_record is None:
+            continue
+        url_records[row["id"]] = UrlRecord(
+            host=web_record.host,
+            port=web_record.port,
+            path=str(row.get("path", "")),
+            source=str(row.get("source") or ""),
+            evidence_id=evidence_id,
+        )
+        records.append(url_records[row["id"]])
+
+    # -- crawl endpoints: require the parent URL to be projected ---------------
+    #
+    # ``EndpointRecord`` carries the hostname only (committed model, unchanged); the
+    # port that disambiguates two apps on the same host is deliberately not part of the
+    # endpoint key.
+    endpoint_keys: dict[UUID, str] = {}
+    for row in sorted(
+        facts.endpoints,
+        key=lambda r: (
+            str(r.get("pattern", "")),
+            str(r.get("method", "")),
+            str(r.get("id")),
+        ),
+    ):
+        evidence_id = ref(ENTITY_ENDPOINT, row.get("id"))
+        url_record = url_records.get(row.get("url_id"))
+        if evidence_id is None or url_record is None:
+            continue
+        key = endpoint_key(
+            str(row.get("method", "")), str(row.get("pattern", "")), url_record.host
+        )
+        endpoint_keys[row["id"]] = key
         records.append(
-            WebAppRecord(
-                host=str(asset.get("hostname", "")),
-                port=int(port_row.get("port_number") or 0),
-                status_code=int(status) if status is not None else _UNKNOWN_STATUS_CODE,
-                title=str(row.get("title") or ""),
-                ip=str(ip_row.get("address", "")),
+            EndpointRecord(
+                method=str(row.get("method", "")),
+                pattern=str(row.get("pattern", "")),
+                host=url_record.host,
+                evidence_id=evidence_id,
+            )
+        )
+
+    # -- crawl parameters: require the parent endpoint to be projected ---------
+    for row in sorted(
+        facts.parameters,
+        key=lambda r: (str(r.get("name", "")), str(r.get("id"))),
+    ):
+        evidence_id = ref(ENTITY_PARAMETER, row.get("id"))
+        parent_key = endpoint_keys.get(row.get("endpoint_id"))
+        if evidence_id is None or parent_key is None:
+            continue
+        records.append(
+            ParameterRecord(
+                endpoint_key=parent_key,
+                name=str(row.get("name", "")),
+                location=str(row.get("location") or ""),
+                significance=str(row.get("significance") or ""),
+                evidence_id=evidence_id,
+            )
+        )
+
+    # -- crawl JavaScript files: require the web app below to be projected ------
+    for row in sorted(
+        facts.javascript_files,
+        key=lambda r: (str(r.get("url", "")), str(r.get("id"))),
+    ):
+        evidence_id = ref(ENTITY_JAVASCRIPT, row.get("id"))
+        web_record = web_app_records.get(row.get("web_app_id"))
+        if evidence_id is None or web_record is None:
+            continue
+        records.append(
+            JavaScriptRecord(
+                js_url=str(row.get("url", "")),
+                host=web_record.host,
                 evidence_id=evidence_id,
             )
         )
@@ -389,11 +505,13 @@ def project(run_id: Optional[UUID], facts: RunFacts) -> AttackSurface:
 
     ``correlation.asset_graph.build`` and ``correlation.relationship_engine.run`` are
     invoked exactly as committed -- no wrapping, no altered arguments, no new inference
-    kinds. With a Phase-14-shaped dataset this legitimately yields a connected graph
+    kinds. With a Phase-14-shaped dataset this yields a connected graph
     (domain/IP/port/web-app/technology with ``parent_of``/``resolves_to``/``hosts``/
-    ``serves``/``runs``) and **zero** inferences, because every inference rule in the
-    engine is gated on endpoint-class nodes that have no producer yet. That empty result
-    is reported honestly rather than padded.
+    ``serves``/``runs``) and zero inferences, because every inference rule in the engine
+    is gated on endpoint-class nodes that Phase 14 cannot produce. Once Phase 22 crawl
+    facts exist the endpoint records are projected from real crawled endpoints, and any
+    inference rule whose gate they genuinely satisfy fires; an empty inference result is
+    still reported honestly rather than padded when no gate is met.
     """
     records = build_records(facts)
     graph = build_graph(records)

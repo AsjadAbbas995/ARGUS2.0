@@ -10,6 +10,7 @@ bounded, allowlisted, deduplicated and deterministic.
 
 from __future__ import annotations
 
+import json
 from uuid import UUID, uuid4
 
 import pytest
@@ -21,9 +22,12 @@ from recon.expansion import (
     CHILD_TYPE_DNS,
     CHILD_TYPE_HTTP_PROBE,
     CHILD_TYPE_PORT_SCAN,
+    CHILD_TYPE_TECH_DETECT,
+    CHILD_TYPE_WEB_CRAWL,
     plan_discovery_expansion,
 )
 from recon.ports.nmap import PortObservation
+from recon.web.httpx_probe import WebAppObservation
 
 
 def _scope() -> ScopeGuard:
@@ -57,6 +61,29 @@ def _types(tasks) -> set[str]:
 
 def _targets(tasks, child_type: str) -> list[str]:
     return sorted(t.target for t in tasks if t.type == child_type)
+
+
+TYPES_WITH_TECH = ("dns_resolve", "port_scan", "http_probe", "tech_detect")
+
+
+def _web_app(
+    *,
+    host: str = "www.example.com",
+    port: int = 443,
+    title: str = "",
+    webserver: str = "",
+    content_type: str = "",
+) -> WebAppObservation:
+    return WebAppObservation(
+        host=host,
+        url=f"https://{host}:{port}/",
+        scheme="https",
+        port=port,
+        status_code=200,
+        title=title,
+        webserver=webserver,
+        content_type=content_type,
+    )
 
 
 # -- mapping ------------------------------------------------------------------
@@ -216,3 +243,250 @@ def test_children_tasks_are_plain_tasks() -> None:
     tasks = _expand(["www.example.com"])
     assert all(isinstance(t, Task) for t in tasks)
     assert all(t.id for t in tasks)
+
+
+# -- mapping: web app -> tech_detect (Phase 21A) ------------------------------
+
+
+def test_web_app_observation_implies_tech_detect() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [_web_app(webserver="nginx", title="Example", content_type="text/html")],
+        parent=parent,
+        available_types=TYPES_WITH_TECH,
+    )
+    assert _types(tasks) == {"tech_detect"}
+    assert _targets(tasks, CHILD_TYPE_TECH_DETECT) == ["www.example.com:443"]
+
+
+def test_tech_detect_child_embeds_captured_signals_for_fingerprint_reuse() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [
+            _web_app(
+                webserver=" cloudflare ",
+                title="Example App",
+                content_type="text/html; charset=utf-8",
+            )
+        ],
+        parent=parent,
+        available_types=TYPES_WITH_TECH,
+    )
+    assert len(tasks) == 1
+    assert json.loads(tasks[0].reason) == {
+        "server_header": "cloudflare",
+        "title": "Example App",
+        "content_type": "text/html; charset=utf-8",
+    }
+
+
+def test_tech_detect_child_fetches_when_the_probe_captured_no_signals() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [_web_app()],
+        parent=parent,
+        available_types=TYPES_WITH_TECH,
+    )
+    assert len(tasks) == 1
+    assert tasks[0].reason is None
+
+
+def test_tech_detect_is_blocked_when_not_allowlisted() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [_web_app(webserver="nginx")],
+        parent=parent,
+    )
+    assert tasks == []
+
+
+def test_tech_detect_never_targets_an_out_of_scope_host() -> None:
+    parent = _parent(target="example.com", task_type="http_probe")
+    tasks = _expand(
+        [_web_app(host="evil.example.org")],
+        parent=parent,
+        available_types=TYPES_WITH_TECH,
+    )
+    assert tasks == []
+
+
+def test_tech_detect_never_targets_a_non_web_port() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [_web_app(port=22)],
+        parent=parent,
+        available_types=TYPES_WITH_TECH,
+    )
+    assert tasks == []
+
+
+def test_duplicate_web_apps_propose_one_tech_detect_task() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [_web_app(webserver="nginx"), _web_app(webserver="nginx")],
+        parent=parent,
+        available_types=TYPES_WITH_TECH,
+    )
+    assert len(tasks) == 1
+    assert _types(tasks) == {"tech_detect"}
+
+    dedup = _expand(
+        [_web_app(webserver="nginx"), _web_app(webserver="apache")],
+        parent=parent,
+        available_types=TYPES_WITH_TECH,
+    )
+    assert [t.target for t in dedup] == ["www.example.com:443"]
+
+
+# -- mapping: web app -> web_crawl / katana (Phase 22) -------------------------
+
+
+TYPES_WITH_CRAWL = TYPES_WITH_TECH + ("web_crawl",)
+
+
+def test_web_app_observation_implies_web_crawl() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [_web_app(port=443)],
+        parent=parent,
+        available_types=TYPES_WITH_CRAWL,
+    )
+    assert _types(tasks) == {"tech_detect", "web_crawl"}
+    assert _targets(tasks, CHILD_TYPE_WEB_CRAWL) == ["https://www.example.com:443/"]
+
+
+def test_crawl_target_uses_the_recorded_app_url() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [WebAppObservation(host="www.example.com", url="https://www.example.com/", scheme="https", port=443, status_code=200)],
+        parent=parent,
+        available_types=TYPES_WITH_CRAWL,
+    )
+    assert _targets(tasks, CHILD_TYPE_WEB_CRAWL) == ["https://www.example.com/"]
+
+
+def test_crawl_seed_falls_back_to_scheme_host_port() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    for port, scheme in ((80, "http"), (443, "https"), (8443, "https"), (8080, "http")):
+        tasks = _expand(
+            [
+                WebAppObservation(
+                    host="www.example.com",
+                    url="",
+                    scheme=scheme,
+                    port=port,
+                    status_code=200,
+                )
+            ],
+            parent=parent,
+            available_types=TYPES_WITH_CRAWL,
+        )
+        assert _targets(tasks, CHILD_TYPE_WEB_CRAWL) == [
+            f"{scheme}://www.example.com:{port}/"
+        ]
+
+
+def test_crawl_reason_carries_the_seed_url_for_reuse() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [_web_app(port=8080)],
+        parent=parent,
+        available_types=TYPES_WITH_CRAWL,
+    )
+    crawler = next(t for t in tasks if t.type == CHILD_TYPE_WEB_CRAWL)
+    assert json.loads(crawler.reason or "{}") == {"url": crawler.target}
+
+
+def test_katana_spelling_proposes_one_katana_task() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [_web_app(port=443)],
+        parent=parent,
+        available_types=TYPES_WITH_TECH + ("katana",),
+    )
+    assert _types(tasks) == {"tech_detect", "katana"}
+    assert _targets(tasks, "katana") == ["https://www.example.com:443/"]
+
+
+def test_web_crawl_and_katana_never_both_propose_a_crawler() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [_web_app(port=443)],
+        parent=parent,
+        available_types=TYPES_WITH_TECH + ("web_crawl", "katana"),
+    )
+    crawlers = [t for t in tasks if t.type in ("web_crawl", "katana")]
+    assert len(crawlers) == 1
+    assert crawlers[0].type == "web_crawl"
+
+
+def test_crawl_is_blocked_when_no_crawl_type_is_allowlisted() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [_web_app(webserver="nginx")],
+        parent=parent,
+        available_types=TYPES_WITH_TECH,
+    )
+    assert _types(tasks) == {"tech_detect"}
+
+
+def test_crawl_honors_the_crawling_config_gate() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    off = _expand(
+        [_web_app(port=443)],
+        parent=parent,
+        available_types=TYPES_WITH_CRAWL,
+        config={"web": {"crawling": False}},
+    )
+    assert _types(off) == {"tech_detect"}
+    default = _expand(
+        [_web_app(port=443)],
+        parent=parent,
+        available_types=TYPES_WITH_CRAWL,
+    )
+    assert "web_crawl" in _types(default)
+    explicit_on = _expand(
+        [_web_app(port=443)],
+        parent=parent,
+        available_types=TYPES_WITH_CRAWL,
+        config={"web": {"crawling": True}},
+    )
+    assert "web_crawl" in _types(explicit_on)
+
+
+def test_crawl_never_targets_an_out_of_scope_host() -> None:
+    parent = _parent(target="example.com", task_type="http_probe")
+    tasks = _expand(
+        [_web_app(host="evil.example.org", port=443)],
+        parent=parent,
+        available_types=TYPES_WITH_CRAWL,
+    )
+    assert tasks == []
+
+
+def test_crawl_never_proposed_for_a_non_web_port() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [
+            WebAppObservation(
+                host="www.example.com",
+                url="http://www.example.com:2222/",
+                scheme="http",
+                port=2222,
+                status_code=200,
+            )
+        ],
+        parent=parent,
+        available_types=TYPES_WITH_CRAWL,
+    )
+    assert tasks == []
+
+
+def test_duplicate_web_apps_propose_one_crawl_task() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [_web_app(port=443), _web_app(port=443)],
+        parent=parent,
+        available_types=TYPES_WITH_CRAWL,
+    )
+    assert len([t for t in tasks if t.type == CHILD_TYPE_WEB_CRAWL]) == 1

@@ -206,7 +206,21 @@ class TestCoverageGaps:
         )
 
     def test_a_stage_with_no_adapter_is_a_gap_not_a_task(self):
-        assert "web_crawl" not in run_context.coverage_gaps([], self.EXEC)
+        # Phase 22 gave ``web_crawl`` a served adapter (``katana``), so a stage that
+        # is neither in ``STAGE_PRIORITY`` nor registered can never become a gap task.
+        assert "certificate" not in run_context.coverage_gaps([], ("certificate",))
+        assert "certificate" not in run_context.uncovered_without_capability(
+            [], ("certificate",)
+        )
+
+    def test_a_crawl_task_type_covers_the_crawl_stage(self):
+        # Phase 22: a completed ``katana`` task satisfies the ``web_crawl`` stage,
+        # exactly like ``resolve`` did for ``dns_resolve`` before it.
+        executable = self.EXEC + ("web_crawl", "katana")
+        assert "web_crawl" in run_context.coverage_gaps([], executable)
+        assert "web_crawl" not in run_context.coverage_gaps(
+            [_task("katana")], executable
+        )
 
     def test_uncovered_without_capability_reports_the_rest(self):
         blocked = run_context.uncovered_without_capability([], self.EXEC)
@@ -478,11 +492,18 @@ class TestServedComposition:
 
     def test_the_gate_excludes_every_stage_without_an_adapter(self):
         orch = _served_orchestrator(True)
-        # Phase 20A registered Subfinder and Nmap adapters, so every stage with a
-        # served adapter is translatable into a runnable task type. Only the stages
-        # that still lack an adapter (``tech_detect``) must not be runnable.
+        # Phase 20A registered Subfinder and Nmap adapters; Phase 21A registered
+        # the served ``tech_detect`` adapter, so every stage with a served adapter
+        # is translatable into a runnable task type. Only stages that still lack an
+        # adapter must not be runnable.
         covered = frozenset(
-            {"dns_resolve", "http_probe", "subdomain_enum", "port_scan"}
+            {
+                "dns_resolve",
+                "http_probe",
+                "subdomain_enum",
+                "port_scan",
+                "tech_detect",
+            }
         )
         for stage, task_type in ai_loop.TASK_TYPE_FOR_STAGE.items():
             if stage in covered:

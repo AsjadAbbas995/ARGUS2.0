@@ -1,0 +1,5 @@
+{"request":{"method":"GET","endpoint":"http://www.example.com:8080/"},"response":{"status_code":200},"title":"Home"}
+{"request":{"method":"GET","endpoint":"http://www.example.com:8080/about"},"source":"http://www.example.com:8080/"}
+{"request":{"method":"GET","endpoint":"http://www.example.com:8080/search?q=argus&page=2"},"source":"http://www.example.com:8080/about"}
+{"request":{"method":"GET","endpoint":"http://www.example.com:8080/static/app.js"},"source":"http://www.example.com:8080/"}
+{"request":{"method":"GET","endpoint":"http://www.example.com:8080/login?next=/admin"},"source":"http://www.example.com:8080/"}

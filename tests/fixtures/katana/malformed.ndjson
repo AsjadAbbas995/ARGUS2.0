@@ -1,0 +1,6 @@
+this is not json
+{"request":{"method":"GET","endpoint":"http://www.example.com:8080/valid"}}
+{"request":{"method":"GET"}}
+{"request":{"method":"GET","endpoint":"http://www.example.com:8080/also-valid"}}
+
+{"request":{"method":"GET","endpoint":"not-a-url"}}

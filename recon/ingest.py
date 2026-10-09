@@ -34,6 +34,12 @@ from recon.web.httpx_probe import (
     TechnologyObservation,
     WebAppObservation,
 )
+from recon.web.katana import (
+    EndpointObservation,
+    JavascriptFileObservation,
+    ParameterObservation,
+    UrlObservation,
+)
 
 #: ``technologies.category`` is ``NOT NULL`` with a CHECK over a fixed set, but
 #: ``TechnologyObservation`` carries only a name. ``'other'`` is the only honest
@@ -64,6 +70,14 @@ ENTITY_OBSERVED_IP = "observed_ip"
 #: NOT NULL and the observation carries no IP. Preserved, never fabricated.
 ENTITY_OBSERVED_WEB_APP = "observed_web_app"
 ENTITY_ARTIFACT_CAP = "artifact_cap"
+#: Crawl facts (Phase 22): canonical ``urls``/``endpoints``/``parameters``/
+#: ``javascript_files`` entity tags. A crawl fact whose parent web app is not
+#: persisted is preserved with the **same** tag and a NULL ``entity_id``
+#: (observation only), so it is counted but never promoted to a graph row.
+ENTITY_URL = "url"
+ENTITY_ENDPOINT = "endpoint"
+ENTITY_PARAMETER = "parameter"
+ENTITY_JAVASCRIPT = "javascript"
 
 
 @dataclass(frozen=True)
@@ -143,6 +157,51 @@ class OutOfScopeObservation:
 
 
 @dataclass(frozen=True)
+class UrlPlan:
+    """One ``urls`` row for an in-scope host (path, source = plan source tool)."""
+
+    hostname: str
+    port: int
+    path: str
+
+
+@dataclass(frozen=True)
+class EndpointPlan:
+    """One ``endpoints`` row under its url, with the method Katana reported."""
+
+    hostname: str
+    port: int
+    path: str
+    method: str
+
+
+@dataclass(frozen=True)
+class ParameterPlan:
+    """One ``parameters`` row under its endpoint (query location, honesty unknown).
+
+    ``method`` names the crawl endpoint the parameter was observed on, keeping
+    exact provenance when one path is served under several methods.
+    """
+
+    hostname: str
+    port: int
+    path: str
+    name: str
+    method: str = "GET"
+    location: str = "query"
+    significance: str = "unknown"
+
+
+@dataclass(frozen=True)
+class JavascriptFilePlan:
+    """One ``javascript_files`` row for its web app (full canonical URL)."""
+
+    hostname: str
+    port: int
+    url: str
+
+
+@dataclass(frozen=True)
 class IngestionPlan:
     """Everything one execution may persist, already scope-classified.
 
@@ -157,6 +216,10 @@ class IngestionPlan:
     web_apps: tuple[WebAppPlan, ...] = ()
     technologies: tuple[TechnologyLinkPlan, ...] = ()
     ports: tuple[PortPlan, ...] = ()
+    urls: tuple[UrlPlan, ...] = ()
+    endpoints: tuple[EndpointPlan, ...] = ()
+    parameters: tuple[ParameterPlan, ...] = ()
+    javascript_files: tuple[JavascriptFilePlan, ...] = ()
     out_of_scope: tuple[OutOfScopeObservation, ...] = ()
     unrecognized: int = 0
     truncated: int = 0
@@ -171,6 +234,10 @@ class IngestionPlan:
             or self.web_apps
             or self.technologies
             or self.ports
+            or self.urls
+            or self.endpoints
+            or self.parameters
+            or self.javascript_files
             or self.out_of_scope
         )
 
@@ -220,6 +287,14 @@ def plan_ingestion(
     seen_tech: set[tuple[str, str]] = set()
     ports: list[PortPlan] = []
     seen_ports: set[tuple[str, int, str]] = set()
+    urls: list[UrlPlan] = []
+    seen_url: set[tuple[str, int, str]] = set()
+    endpoints: list[EndpointPlan] = []
+    seen_endpoint: set[tuple[str, int, str, str]] = set()
+    parameters: list[ParameterPlan] = []
+    seen_parameter: set[tuple[str, int, str, str, str]] = set()
+    javascript_files: list[JavascriptFilePlan] = []
+    seen_js: set[tuple[str, int, str]] = set()
     unrecognized = 0
 
     def check(kind: str, value: str) -> bool:
@@ -296,7 +371,9 @@ def plan_ingestion(
                 if key not in seen_tech:
                     seen_tech.add(key)
                     technologies.append(
-                        TechnologyLinkPlan(hostname=host, name=artifact.technology)
+                        TechnologyLinkPlan(
+                            hostname=host, name=artifact.technology, category=artifact.category
+                        )
                     )
         elif isinstance(artifact, TechnologyObservation):
             # A bare technology with no host cannot be attributed to an asset
@@ -308,7 +385,7 @@ def plan_ingestion(
                 if key not in seen_tech:
                     seen_tech.add(key)
                     technologies.append(
-                        TechnologyLinkPlan(hostname=host, name=artifact.name)
+                        TechnologyLinkPlan(hostname=host, name=artifact.name, category=artifact.category)
                     )
         elif isinstance(artifact, PortObservation):
             # A port's authoritative discovery surface is its IP
@@ -336,6 +413,50 @@ def plan_ingestion(
                         host=host or "",
                     )
                 )
+        elif isinstance(artifact, UrlObservation):
+            host = classify_host(artifact.host)
+            if host is not None:
+                key = (host, artifact.port, artifact.path)
+                if key not in seen_url:
+                    seen_url.add(key)
+                    urls.append(UrlPlan(hostname=host, port=artifact.port, path=artifact.path))
+        elif isinstance(artifact, EndpointObservation):
+            host = classify_host(artifact.host)
+            if host is not None:
+                key = (host, artifact.port, artifact.path, artifact.method)
+                if key not in seen_endpoint:
+                    seen_endpoint.add(key)
+                    endpoints.append(
+                        EndpointPlan(
+                            hostname=host, port=artifact.port, path=artifact.path, method=artifact.method
+                        )
+                    )
+        elif isinstance(artifact, ParameterObservation):
+            host = classify_host(artifact.host)
+            if host is not None:
+                key = (host, artifact.port, artifact.path, artifact.method, artifact.name)
+                if key not in seen_parameter:
+                    seen_parameter.add(key)
+                    parameters.append(
+                        ParameterPlan(
+                            hostname=host,
+                            port=artifact.port,
+                            path=artifact.path,
+                            name=artifact.name,
+                            method=artifact.method,
+                            location=artifact.location,
+                            significance=artifact.significance,
+                        )
+                    )
+        elif isinstance(artifact, JavascriptFileObservation):
+            host = classify_host(artifact.host)
+            if host is not None:
+                key = (host, artifact.port, artifact.url)
+                if key not in seen_js:
+                    seen_js.add(key)
+                    javascript_files.append(
+                        JavascriptFilePlan(hostname=host, port=artifact.port, url=artifact.url)
+                    )
         else:
             unrecognized += 1
 
@@ -346,6 +467,10 @@ def plan_ingestion(
         web_apps=tuple(web_apps),
         technologies=tuple(technologies),
         ports=tuple(ports),
+        urls=tuple(urls),
+        endpoints=tuple(endpoints),
+        parameters=tuple(parameters),
+        javascript_files=tuple(javascript_files),
         out_of_scope=tuple(out_of_scope.values()),
         unrecognized=unrecognized,
         truncated=truncated,

@@ -24,6 +24,12 @@ from recon.web.httpx_probe import (
     TechnologyObservation,
     WebAppObservation,
 )
+from recon.web.katana import (
+    EndpointObservation,
+    JavascriptFileObservation,
+    ParameterObservation,
+    UrlObservation,
+)
 
 
 def make_guard() -> ScopeGuard:
@@ -113,6 +119,23 @@ def test_technology_defaults_category_and_confidence() -> None:
     assert tech.confidence == OBSERVED_TECHNOLOGY_CONFIDENCE
 
 
+def test_technology_category_passes_through_from_the_observation() -> None:
+    # Phase 21A: a detector may carry an explicit category (WAF/CDN/etc.) on the
+    # observation; the plan forwards it verbatim for the repositories to persist.
+    result = plan(
+        [
+            AssetTechnologyObservation(
+                host="example.com", technology="cloudflare", category="cdn"
+            ),
+            TechnologyObservation(name="wordpress", category="cms"),
+        ]
+    )
+    assert {t.name: t.category for t in result.technologies} == {
+        "cloudflare": "cdn",
+        "wordpress": "cms",
+    }
+
+
 # -- ports (Phase 20A) --------------------------------------------------------
 
 
@@ -193,6 +216,97 @@ def test_duplicate_port_observations_collapse() -> None:
 def test_port_makes_a_plan_non_empty() -> None:
     result = plan([PortObservation(address="203.0.113.12", port=443)])
     assert result.is_empty is False
+
+
+# -- crawl facts (Phase 22) ----------------------------------------------------
+
+
+def test_crawl_observations_map_to_plans() -> None:
+    result = plan(
+        [
+            UrlObservation(host="www.example.com", port=8080, path="/"),
+            EndpointObservation(
+                host="www.example.com", port=8080, path="/", method="GET"
+            ),
+            ParameterObservation(
+                host="www.example.com",
+                port=8080,
+                path="/",
+                name="q",
+                method="GET",
+            ),
+            JavascriptFileObservation(
+                host="www.example.com",
+                port=8080,
+                url="http://www.example.com:8080/static/app.js",
+            ),
+        ]
+    )
+    assert [(u.hostname, u.port, u.path) for u in result.urls] == [
+        ("www.example.com", 8080, "/")
+    ]
+    assert [(e.hostname, e.port, e.path, e.method) for e in result.endpoints] == [
+        ("www.example.com", 8080, "/", "GET")
+    ]
+    assert [
+        (p.hostname, p.port, p.path, p.name, p.method, p.location, p.significance)
+        for p in result.parameters
+    ] == [("www.example.com", 8080, "/", "q", "GET", "query", "unknown")]
+    assert [(j.hostname, j.port, j.url) for j in result.javascript_files] == [
+        ("www.example.com", 8080, "http://www.example.com:8080/static/app.js")
+    ]
+    # The in-scope host also produces an asset plan, exactly like other discovery.
+    assert {a.hostname for a in result.assets} == {"www.example.com"}
+
+
+def test_crawl_observations_for_out_of_scope_hosts_are_preserved() -> None:
+    result = plan(
+        [
+            UrlObservation(host="evil.example.org", port=80, path="/"),
+            EndpointObservation(host="evil.example.org", port=80, path="/", method="GET"),
+        ]
+    )
+    assert result.urls == ()
+    assert result.endpoints == ()
+    assert [o.value for o in result.out_of_scope] == ["evil.example.org"]
+
+
+def test_crawl_observations_for_an_excluded_host_are_not_promoted() -> None:
+    result = plan(
+        [UrlObservation(host="internal.example.com", port=80, path="/")]
+    )
+    assert result.urls == ()
+    assert [o.value for o in result.out_of_scope] == ["internal.example.com"]
+
+
+def test_duplicate_crawl_observations_collapse() -> None:
+    result = plan(
+        [
+            UrlObservation(host="www.example.com", port=8080, path="/"),
+            UrlObservation(host="www.example.com", port=8080, path="/"),
+            EndpointObservation(host="www.example.com", port=8080, path="/", method="GET"),
+            EndpointObservation(host="www.example.com", port=8080, path="/", method="GET"),
+            # Same path under a different method is a real, distinct endpoint.
+            EndpointObservation(host="www.example.com", port=8080, path="/", method="POST"),
+            ParameterObservation(
+                host="www.example.com", port=8080, path="/", name="q", method="GET"
+            ),
+            ParameterObservation(
+                host="www.example.com", port=8080, path="/", name="q", method="GET"
+            ),
+        ]
+    )
+    assert len(result.urls) == 1
+    assert [(e.method, e.path) for e in result.endpoints] == [
+        ("GET", "/"),
+        ("POST", "/"),
+    ]
+    assert len(result.parameters) == 1
+
+
+def test_crawl_facts_make_a_plan_non_empty() -> None:
+    assert plan([UrlObservation(host="www.example.com", port=80, path="/")]).is_empty is False
+    assert plan([]).is_empty is True
 
 
 # -- normalization ----------------------------------------------------------

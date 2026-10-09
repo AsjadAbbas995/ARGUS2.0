@@ -461,7 +461,10 @@ def test_unavailable_matches_the_shape_of_a_real_surface():
 
 def test_unproduced_record_kinds_are_declared_not_hidden():
     payload = serialize(project(uuid4(), RunFacts()))
-    assert "endpoint" in payload["unproduced_record_kinds"]
+    # Phase 22 made urls/endpoints/parameters/javascript_files produced, so a previously
+    # unproduced kind must no longer be declared as one; the still-unproduced kinds stay.
+    assert "certificate" in payload["unproduced_record_kinds"]
+    assert "endpoint" not in payload["unproduced_record_kinds"]
 
 
 # ---------------------------------------------------------------------------

@@ -594,11 +594,26 @@ def test_phase14_ingest_path_is_parameterized_not_interpolated():
 def test_phase14_ingest_path_passes_values_as_query_parameters():
     """Every attacker-influenced value must travel as a bound parameter, not a literal."""
     module = inspect.getsource(repos_all)
-    fn_source = inspect.getsource(repos_all.Repositories.ingest_observations)
+    tree = ast.parse(module)
+    fn = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "ingest_observations"
+    )
     # plan values are handed to repositories, which bind them; the ingest function
-    # itself must not concatenate any plan field into a statement.
-    for field in ("plan.hostname", "plan.address", "plan.url", "plan.title"):
-        assert field not in fn_source, f"{field} must not reach SQL as text"
+    # itself must not read a *scalar* plan field to build SQL text. Matched on the AST
+    # attribute rather than a raw substring so the Phase 22 collection ``plan.urls`` --
+    # whose name merely contains ``plan.url`` -- is not mistaken for such a read.
+    scalar_fields = {"hostname", "address", "url", "title"}
+    offenders = [
+        node.attr
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "plan"
+        and node.attr in scalar_fields
+    ]
+    assert not offenders, f"plan fields must not reach SQL as text: {offenders}"
     # the only literals it builds are the fixed evidence entity-type tags
     assert "ENTITY_" in module
 

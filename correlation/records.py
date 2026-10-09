@@ -69,6 +69,21 @@ class WebAppRecord:
 
 
 @dataclass(frozen=True)
+class UrlRecord:
+    """A recorded crawl URL (one path under a web app's host:port)."""
+
+    host: str
+    port: int
+    path: str
+    source: str
+    evidence_id: str
+
+    @property
+    def key(self) -> str:
+        return f"{self.host}:{self.port}{self.path}"
+
+
+@dataclass(frozen=True)
 class EndpointRecord:
     """A recorded HTTP endpoint (method + URL pattern on a host)."""
 

@@ -66,6 +66,11 @@ TASK_TYPE_COVERS_STAGE: Mapping[str, str] = {
     "naabu": "port_scan",
     "tech_detect": "tech_detect",
     "whatweb": "tech_detect",
+    # Phase 22: deterministic web crawling. ``katana`` is the adapter's tool spelling;
+    # ``web_crawl`` is the stage name the coverage loop already knows, so a task of
+    # either type satisfies the same stage.
+    "web_crawl": "web_crawl",
+    "katana": "web_crawl",
 }
 
 #: Terminal task statuses that mean the stage actually produced coverage. A task that is still

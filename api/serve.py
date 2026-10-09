@@ -55,6 +55,8 @@ from recon.normalize import normalize_hostname
 from recon.ports.nmap import NmapAdapter
 from recon.subdomains.subfinder import SubfinderAdapter
 from recon.web.httpx_probe import HttpxProbeAdapter
+from recon.web.katana import KatanaAdapter
+from recon.web.tech_detect import TechDetectAdapter
 
 log = logging.getLogger(__name__)
 
@@ -74,6 +76,7 @@ API_KEY_ENV = "ARGUS_API_KEY"
 #: :class:`UnknownTaskType`.
 DEFAULT_ADAPTER_TYPES: tuple[str, ...] = ("dns_resolve", "dns", "resolve")
 DEFAULT_HTTP_PROBE_TYPES: tuple[str, ...] = ("http_probe", "httpx", "web_probe")
+DEFAULT_TECH_DETECT_TYPES: tuple[str, ...] = ("tech_detect", "whatweb")
 #: Phase 20A breadth. ``subdomain_enum`` is the stage name the AI layer already
 #: reports (``ai.run_context.TASK_TYPE_COVERS_STAGE``), so it is registered to the
 #: same Subfinder adapter as ``subfinder``; likewise ``port_scan`` and ``nmap``
@@ -81,6 +84,11 @@ DEFAULT_HTTP_PROBE_TYPES: tuple[str, ...] = ("http_probe", "httpx", "web_probe")
 #: the AI coverage computation consistent instead of reopening a covered gap.
 DEFAULT_SUBFINDER_TYPES: tuple[str, ...] = ("subfinder", "subdomain_enum")
 DEFAULT_PORT_SCAN_TYPES: tuple[str, ...] = ("port_scan", "nmap")
+#: Phase 22: deterministic web crawling. ``web_crawl`` is the documented stage name
+#: the AI layer already reports (``ai.run_context.TASK_TYPE_COVERS_STAGE``), so both
+#: spellings dispatch to the same Katana adapter, keeping the served registry and the
+#: coverage computation consistent.
+DEFAULT_WEB_CRAWL_TYPES: tuple[str, ...] = ("web_crawl", "katana")
 
 
 class ServeConfigurationError(RuntimeError):
@@ -332,6 +340,19 @@ def _default_adapters(
     )
     adapters.update(
         {kind: NmapAdapter for kind in DEFAULT_PORT_SCAN_TYPES}
+    )
+    # Phase 21A: deterministic technology/WAF/CDN fingerprinting. In-process and
+    # stdlib-only; the adapter class is used directly as its own factory because
+    # its constructor takes only keyword defaults. The ``whatweb`` alias is
+    # dispatchable/excludable independently of ``tech_detect``.
+    adapters.update(
+        {kind: TechDetectAdapter for kind in DEFAULT_TECH_DETECT_TYPES}
+    )
+    # Phase 22: deterministic web crawling. ``KatanaAdapter``'s constructor takes only
+    # keyword defaults, so the class is used directly as its own factory, exactly like
+    # ``TechDetectAdapter``. A task type outside this table is refused upstream.
+    adapters.update(
+        {kind: KatanaAdapter for kind in DEFAULT_WEB_CRAWL_TYPES}
     )
     return adapters
 

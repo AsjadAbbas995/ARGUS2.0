@@ -1,0 +1,4 @@
+{"request":{"method":"GET","endpoint":"http://www.example.com:8080/dup"}}
+{"request":{"method":"GET","endpoint":"http://www.example.com:8080/dup?x=1"}}
+{"request":{"method":"GET","endpoint":"http://www.example.com:8080/dup?x=2&y=3"}}
+{"request":{"method":"GET","endpoint":"http://www.example.com:8080/dup"},"response":{"status_code":200}}

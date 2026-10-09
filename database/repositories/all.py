@@ -30,17 +30,22 @@ from recon.ingest import (
     ENTITY_ASSET_IP,
     ENTITY_ASSET_TECHNOLOGY,
     ENTITY_DNS_RECORD,
+    ENTITY_ENDPOINT,
     ENTITY_IP,
+    ENTITY_JAVASCRIPT,
     ENTITY_OBSERVED_HOST,
     ENTITY_OBSERVED_IP,
     ENTITY_OBSERVED_WEB_APP,
+    ENTITY_PARAMETER,
     ENTITY_PORT,
     ENTITY_TECHNOLOGY,
+    ENTITY_URL,
     ENTITY_WEB_APP,
     KIND_IP,
 )
 from database.models.entities import (
     AiAnalysis,
+    AiCoverageGap,
     Asset,
     AssetIp,
     DnsRecord,
@@ -486,6 +491,96 @@ class WebAppRepository(BaseRepository):
             (list(web_app_ids),),
         )
 
+    def get_by_asset_port(self, asset_id, port_id) -> Optional[dict]:
+        """The web app for one (asset, port) pair, or None (Phase 22 rooting)."""
+        return self._fetch_one(
+            "SELECT * FROM web_apps WHERE asset_id = %s AND port_id = %s",
+            (asset_id, port_id),
+        )
+
+
+class UrlRepository(BaseRepository):
+    def upsert(self, web_app_id, path: str, source: str) -> dict:
+        cur = self.conn.execute(
+            "INSERT INTO urls (web_app_id, path, source) VALUES (%s, %s, %s) "
+            "ON CONFLICT (web_app_id, path) DO UPDATE SET source = EXCLUDED.source "
+            "RETURNING *",
+            (web_app_id, path, source),
+        )
+        return cur.fetchone()
+
+    def list_by_ids(self, url_ids: Sequence[UUID]) -> list[dict]:
+        if not url_ids:
+            return []
+        return self._fetch_all(
+            "SELECT * FROM urls WHERE id = ANY(%s::uuid[]) "
+            "ORDER BY path, web_app_id, id",
+            (list(url_ids),),
+        )
+
+
+class EndpointRepository(BaseRepository):
+    def upsert(self, url_id, method: str, pattern: str) -> dict:
+        cur = self.conn.execute(
+            "INSERT INTO endpoints (url_id, method, pattern) VALUES (%s, %s, %s) "
+            "ON CONFLICT (url_id, method, pattern) DO UPDATE SET pattern = EXCLUDED.pattern "
+            "RETURNING *",
+            (url_id, method, pattern),
+        )
+        return cur.fetchone()
+
+    def list_by_ids(self, endpoint_ids: Sequence[UUID]) -> list[dict]:
+        if not endpoint_ids:
+            return []
+        return self._fetch_all(
+            "SELECT * FROM endpoints WHERE id = ANY(%s::uuid[]) "
+            "ORDER BY pattern, method, url_id, id",
+            (list(endpoint_ids),),
+        )
+
+
+class ParameterRepository(BaseRepository):
+    def upsert(
+        self, endpoint_id, name: str, location: str, significance: str
+    ) -> dict:
+        cur = self.conn.execute(
+            "INSERT INTO parameters (endpoint_id, name, location, significance) "
+            "VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (endpoint_id, name, location) "
+            "DO UPDATE SET significance = EXCLUDED.significance RETURNING *",
+            (endpoint_id, name, location, significance),
+        )
+        return cur.fetchone()
+
+    def list_by_ids(self, parameter_ids: Sequence[UUID]) -> list[dict]:
+        if not parameter_ids:
+            return []
+        return self._fetch_all(
+            "SELECT * FROM parameters WHERE id = ANY(%s::uuid[]) "
+            "ORDER BY name, location, endpoint_id, id",
+            (list(parameter_ids),),
+        )
+
+
+class JavascriptFileRepository(BaseRepository):
+    def upsert(self, web_app_id, url: str) -> dict:
+        cur = self.conn.execute(
+            "INSERT INTO javascript_files (web_app_id, url) VALUES (%s, %s) "
+            "ON CONFLICT (web_app_id, url) DO UPDATE SET url = EXCLUDED.url "
+            "RETURNING *",
+            (web_app_id, url),
+        )
+        return cur.fetchone()
+
+    def list_by_ids(self, javascript_ids: Sequence[UUID]) -> list[dict]:
+        if not javascript_ids:
+            return []
+        return self._fetch_all(
+            "SELECT * FROM javascript_files WHERE id = ANY(%s::uuid[]) "
+            "ORDER BY url, web_app_id, id",
+            (list(javascript_ids),),
+        )
+
 
 class TaskRepository(BaseRepository):
     def insert(self, task: Task) -> dict:
@@ -764,6 +859,64 @@ class AiAnalysisRepository(BaseRepository):
         return self._fetch_all("SELECT * FROM ai_analysis ORDER BY id")
 
 
+class AiCoverageGapRepository(BaseRepository):
+    """Canonical ``ai_coverage_gaps`` table access (Phase 18, migration ``0006``).
+
+    One row per ``(run_id, stage)``: a reconnaissance stage this run structurally could
+    not attempt because no registered adapter can run it. The value comes from
+    :func:`ai.run_context.uncovered_without_capability`, which Phase 16 deliberately kept
+    out of proposals and deferred persisting for want of a run-scoped table. Migration
+    ``0006`` is that table.
+
+    ``observe`` is an upsert rather than a plain insert because a gap is re-reported on
+    every analysis pass of the same run, and a run may run many passes. Deduplicating
+    is what keeps "how many gaps does this run have" a property of the run rather than a
+    function of how many passes happened to execute. The pass count is not discarded by
+    that collapse: ``observation_count`` and ``last_seen_at`` carry it, which is the
+    difference between a stable capability gap and one the planner keeps re-proposing.
+
+    ``stage`` is stored verbatim and is deliberately not a foreign key. There is no
+    adapter-registry table -- the registered set is a runtime property of the serving
+    process -- and a gap is by definition the statement that a stage exists with no way
+    to execute it, so a key to an adapter table would make the row unrepresentable.
+    """
+
+    def observe(self, gap: AiCoverageGap) -> dict:
+        """Record one observed gap, or re-observe an existing one for the same run/stage.
+
+        ``ON CONFLICT ... DO UPDATE`` advances ``last_seen_at`` and increments
+        ``observation_count`` rather than inserting a second row, and returns the row as it
+        now stands. ``first_seen_at`` is left alone: it is the first time the run
+        structurally could not do this stage and never moves afterwards.
+
+        The conflict target is the table's own ``UNIQUE (run_id, stage)`` constraint, so the
+        deduplication rule and the constraint cannot drift apart.
+        """
+        cur = self.conn.execute(
+            'INSERT INTO "ai_coverage_gaps" '
+            '("id", "run_id", "stage", "first_seen_at", "last_seen_at", "observation_count") '
+            "VALUES (%s, %s, %s, now(), now(), 1) "
+            "ON CONFLICT ON CONSTRAINT ai_coverage_gaps_run_stage_key DO UPDATE "
+            "   SET last_seen_at = now(), observation_count = "
+            "       ai_coverage_gaps.observation_count + 1 "
+            "RETURNING *",
+            [gap.id, gap.run_id, gap.stage],
+        )
+        return cur.fetchone()
+
+    def list_for_run(self, run_id) -> list[dict]:
+        """The gaps belonging to ``run_id``, in stable stage order.
+
+        The production read: an indexed ``WHERE run_id = %s``. Every gap row carries a real
+        ``run_id`` (the column is ``NOT NULL``), so unlike ``ai_analysis`` there is no
+        unattributable-row case to worry about and no unfiltered variant is needed.
+        """
+        return self._fetch_all(
+            "SELECT * FROM ai_coverage_gaps WHERE run_id = %s ORDER BY stage",
+            (run_id,),
+        )
+
+
 class HypothesisRepository(BaseRepository):
     """Canonical ``hypotheses`` table access (05_DATA_MODEL.md).
 
@@ -845,12 +998,17 @@ class Repositories(Storage):
         self.dns_records = DnsRecordRepository(conn)
         self.ports = PortRepository(conn)
         self.web_apps = WebAppRepository(conn)
+        self.urls = UrlRepository(conn)
+        self.endpoints = EndpointRepository(conn)
+        self.parameters = ParameterRepository(conn)
+        self.javascript_files = JavascriptFileRepository(conn)
         self.tasks = TaskRepository(conn)
         self.tool_runs = ToolRunRepository(conn)
         self.evidence = EvidenceRepository(conn)
         self.technologies = TechnologyRepository(conn)
         self.asset_technologies = AssetTechnologyRepository(conn)
         self.ai_analysis = AiAnalysisRepository(conn)
+        self.ai_coverage_gaps = AiCoverageGapRepository(conn)
         self.hypotheses = HypothesisRepository(conn)
 
     # -- core.orchestrator.Storage contract ----------------------------------
@@ -1067,6 +1225,83 @@ class Repositories(Storage):
                 _evidence(ENTITY_ASSET_TECHNOLOGY),
             )
 
+        # -- Phase 22: crawl facts ---------------------------------------------
+        #
+        # urls/endpoints/parameters/javascript_files hang below a *persisted*
+        # web app, rooted through asset -> ip -> port -> web_app. A plan whose
+        # web app cannot be rooted is preserved as evidence with the same entity
+        # tag and a NULL entity_id -- counted, never fabricated as a graph row.
+        crawl_source = str(plan.source or "katana")
+        web_app_ids: dict[tuple[str, int], Optional[UUID]] = {}
+
+        def _crawl_web_app_id(hostname: str, port_number: int) -> Optional[UUID]:
+            key = (hostname, port_number)
+            if key in web_app_ids:
+                return web_app_ids[key]
+            asset = self.assets.get_by_hostname(program_id, hostname)
+            app_id: Optional[UUID] = None
+            if asset is not None:
+                ip_id = self.asset_ips.ip_id_for_asset(asset["id"])
+                if ip_id is not None:
+                    port_row = self.ports.get_by_ip_port(ip_id, port_number)
+                    if port_row is not None:
+                        app_row = self.web_apps.get_by_asset_port(
+                            asset["id"], port_row["id"]
+                        )
+                        app_id = app_row["id"] if app_row is not None else None
+            web_app_ids[key] = app_id
+            return app_id
+
+        url_ids: dict[tuple[str, int, str], UUID] = {}
+        for url in plan.urls:
+            app_id = _crawl_web_app_id(url.hostname, url.port)
+            if app_id is None:
+                _evidence(ENTITY_URL)
+                continue
+            row = self.urls.upsert(app_id, url.path, crawl_source)
+            _evidence(ENTITY_URL, row["id"])
+            url_ids[(url.hostname, url.port, url.path)] = row["id"]
+
+        endpoint_ids: dict[tuple[str, int, str, str], UUID] = {}
+        for endpoint in plan.endpoints:
+            app_id = _crawl_web_app_id(endpoint.hostname, endpoint.port)
+            if app_id is None:
+                _evidence(ENTITY_ENDPOINT)
+                continue
+            url_id = url_ids.get((endpoint.hostname, endpoint.port, endpoint.path))
+            if url_id is None:
+                _evidence(ENTITY_ENDPOINT)
+                continue
+            row = self.endpoints.upsert(url_id, endpoint.method, endpoint.path)
+            _evidence(ENTITY_ENDPOINT, row["id"])
+            endpoint_ids[
+                (endpoint.hostname, endpoint.port, endpoint.path, endpoint.method)
+            ] = row["id"]
+
+        for parameter in plan.parameters:
+            app_id = _crawl_web_app_id(parameter.hostname, parameter.port)
+            if app_id is None:
+                _evidence(ENTITY_PARAMETER)
+                continue
+            endpoint_id = endpoint_ids.get(
+                (parameter.hostname, parameter.port, parameter.path, parameter.method)
+            )
+            if endpoint_id is None:
+                _evidence(ENTITY_PARAMETER)
+                continue
+            row = self.parameters.upsert(
+                endpoint_id, parameter.name, parameter.location, parameter.significance
+            )
+            _evidence(ENTITY_PARAMETER, row["id"])
+
+        for javascript in plan.javascript_files:
+            app_id = _crawl_web_app_id(javascript.hostname, javascript.port)
+            if app_id is None:
+                _evidence(ENTITY_JAVASCRIPT)
+                continue
+            row = self.javascript_files.upsert(app_id, javascript.url)
+            _evidence(ENTITY_JAVASCRIPT, row["id"])
+
         for observation in plan.out_of_scope:
             # Preserved, never promoted. The evidence table has no reason column,
             # so the scope-denial reason is logged by the caller, not stored.
@@ -1169,6 +1404,25 @@ class Repositories(Storage):
             asset_technologies=tuple(
                 self.asset_technologies.list_for_assets(asset_ids)
             ),
+            # Phase 22 crawl facts, batch-read by the ids this run's evidence names.
+            urls=tuple(
+                self.urls.list_by_ids(sorted(entity_ids.get(ENTITY_URL, ()), key=str))
+            ),
+            endpoints=tuple(
+                self.endpoints.list_by_ids(
+                    sorted(entity_ids.get(ENTITY_ENDPOINT, ()), key=str)
+                )
+            ),
+            parameters=tuple(
+                self.parameters.list_by_ids(
+                    sorted(entity_ids.get(ENTITY_PARAMETER, ()), key=str)
+                )
+            ),
+            javascript_files=tuple(
+                self.javascript_files.list_by_ids(
+                    sorted(entity_ids.get(ENTITY_JAVASCRIPT, ()), key=str)
+                )
+            ),
         )
         return serialize(project(run_id, facts))
 
@@ -1223,4 +1477,70 @@ class Repositories(Storage):
                 created_at=row.get("created_at"),
             )
             for row in rows
+        ]
+
+    # -- Phase 18: capability coverage gaps -------------------------------------
+    #
+    # Additive to the ``Storage`` contract and duck-typed by the caller exactly like
+    # ``insert_ai_analysis``. These record which reconnaissance stages a run structurally
+    # could not attempt -- no registered adapter can run them -- so the distinction Phase 15
+    # computes and Phase 16 kept out of proposals survives process exit.
+    #
+    # They are reported-only. Nothing here creates a task or a hypothesis, and a gap is
+    # never a proposal: a stage the system cannot execute is not work to schedule.
+
+    def observe_coverage_gaps(self, run_id: UUID, stages: Sequence[str]) -> list[AiCoverageGap]:
+        """Record the coverage gaps observed on one analysis pass.
+
+        One row per stage, deduplicated per ``(run_id, stage)``; a stage seen again on a
+        later pass of the same run advances ``last_seen_at`` and ``observation_count``
+        instead of inserting a second row.
+
+        Returns the rows as they now stand, so the caller can report an accurate count
+        without a second query.
+        """
+        observed: list[AiCoverageGap] = []
+        for stage in stages:
+            name = str(stage)
+            # A blank stage would be rejected by ``ai_coverage_gaps_stage_not_blank``;
+            # skipping it here keeps a malformed gap from failing the whole pass, since
+            # a coverage gap is diagnostic output and must never break analysis.
+            if not name.strip():
+                continue
+            row = self.ai_coverage_gaps.observe(
+                AiCoverageGap(run_id=run_id, stage=name)
+            )
+            observed.append(
+                AiCoverageGap(
+                    id=row["id"],
+                    run_id=row["run_id"],
+                    stage=row["stage"],
+                    first_seen_at=row.get("first_seen_at"),
+                    last_seen_at=row.get("last_seen_at"),
+                    observation_count=row.get("observation_count", 1),
+                    created_at=row.get("created_at"),
+                )
+            )
+        return observed
+
+    def list_coverage_gaps(self, run_id: UUID) -> list[AiCoverageGap]:
+        """The run's persisted coverage gaps, in stable stage order.
+
+        Run-scoped by construction: there is no unfiltered variant and no optional
+        ``run_id``, because ``ai_coverage_gaps.run_id`` is ``NOT NULL`` so no gap is
+        unattributable and no caller has a reason to see across runs. This mirrors the
+        Phase 17 principle that the audit path is the only place an unfiltered read is
+        justified, and Phase 18 has no such path.
+        """
+        return [
+            AiCoverageGap(
+                id=row["id"],
+                run_id=row["run_id"],
+                stage=row["stage"],
+                first_seen_at=row.get("first_seen_at"),
+                last_seen_at=row.get("last_seen_at"),
+                observation_count=row.get("observation_count", 1),
+                created_at=row.get("created_at"),
+            )
+            for row in self.ai_coverage_gaps.list_for_run(run_id)
         ]

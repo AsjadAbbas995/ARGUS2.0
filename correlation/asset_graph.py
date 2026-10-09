@@ -43,6 +43,8 @@ def _edges_for(node: Node, by_key: dict[str, Node]) -> list[Edge]:
         return _port_edges(node, by_key)
     if node.kind == "webapp":
         return _webapp_edges(node, by_key)
+    if node.kind == "url":
+        return _url_edges(node, by_key)
     if node.kind == "endpoint":
         return _endpoint_edges(node, by_key)
     if node.kind == "parameter":
@@ -103,6 +105,23 @@ def _webapp_edges(node: Node, by_key: dict[str, Node]) -> list[Edge]:
 def _endpoint_edges(node: Node, by_key: dict[str, Node]) -> list[Edge]:
     host = _attr(node, "host")
     target = _host_node(by_key, host)
+    if target is not None:
+        return [Edge(target.key, node.key, "serves_url", node.evidence_id)]
+    return []
+
+
+def _url_edges(node: Node, by_key: dict[str, Node]) -> list[Edge]:
+    """Link a crawl URL under ``host:port`` -> its web app node.
+
+    The web app node is keyed ``host:port`` exactly, so it is resolved first; when only
+    a bare host node (a domain) exists, ``_host_node`` falls back to it, matching the
+    committed endpoint edge behavior.
+    """
+    host = _attr(node, "host")
+    port = _attr(node, "port")
+    target = by_key.get(f"{host}:{port}")
+    if target is None:
+        target = _host_node(by_key, host)
     if target is not None:
         return [Edge(target.key, node.key, "serves_url", node.evidence_id)]
     return []
