@@ -1,0 +1,6 @@
+{"results": [
+  {"status": 200, "url": "http://www.example.com:8080/login"},
+  {"status": 500, "url": "http://www.example.com:8080/login"},
+  {"status": 301, "url": "http://www.example.com:8080/old"},
+  {"status": 200, "url": "http://www.example.com:8080/old"}
+]}

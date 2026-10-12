@@ -71,6 +71,11 @@ TASK_TYPE_COVERS_STAGE: Mapping[str, str] = {
     # either type satisfies the same stage.
     "web_crawl": "web_crawl",
     "katana": "web_crawl",
+    # Phase 23: approved-wordlist content discovery. ``content_discover`` is the
+    # stage name and the canonical task type; ``ffuf`` is the adapter's tool
+    # spelling, so a task of either type satisfies the same stage.
+    "content_discover": "content_discover",
+    "ffuf": "content_discover",
 }
 
 #: Terminal task statuses that mean the stage actually produced coverage. A task that is still

@@ -20,10 +20,13 @@ Safety rules, all enforced here *before* a task can be proposed:
 * Only task types already registered by the composition are proposed
   (``available_types`` allowlist), so expansion can never invent a task the
   server would refuse.
-* A discovered web application warrants two children: a ``tech_detect`` for
-  technology fingerprinting and, when crawling is enabled (``web.crawling`` in
-  the run's configuration, default true) and ``web_crawl``/``katana`` is
-  registered, a deterministic crawl whose seed is the app's own recorded URL.
+* A discovered web application warrants three children: a ``tech_detect`` for
+  technology fingerprinting, a deterministic crawl when crawling is enabled
+  (``web.crawling`` in the run's configuration, default true) and
+  ``web_crawl``/``katana`` is registered, and, when the run *approved* a content
+  discovery wordlist (``web.content_discovery.wordlist``), a bounded
+  ``content_discover``/``ffuf`` against the same app. The crawl and the
+  content-discovery child share the app's own recorded URL as their seed.
 * The output is bounded (``max_tasks``) and sorted by ``(type, target)`` so the
   same artifacts always propose the same children in the same order.
 * No exploit, credential, brute-force, or scope-expanding behavior is expressed
@@ -50,6 +53,7 @@ CHILD_TYPE_PORT_SCAN = "port_scan"
 CHILD_TYPE_HTTP_PROBE = "http_probe"
 CHILD_TYPE_TECH_DETECT = "tech_detect"
 CHILD_TYPE_WEB_CRAWL = "web_crawl"
+CHILD_TYPE_CONTENT_DISCOVER = "content_discover"
 
 #: Ports worth an HTTP probe. Deliberately conservative: a full "anything that
 #: might speak HTTP" list would fan out; these are the conventional clear-text and
@@ -111,6 +115,31 @@ def _crawl_seed(artifact: WebAppObservation) -> str:
 def _crawl_reuse_reason(seed: str) -> str:
     """The seed doubles as the fingerprint-reuse payload (``{"url": seed}``)."""
     return json.dumps({"url": seed}, sort_keys=True)
+
+
+def _approved_content_discovery(config: Optional[dict]) -> bool:
+    """Whether the run actually approved a content-discovery wordlist.
+
+    Approval means the operator set ``web.content_discovery.wordlist``, which the
+    snapshot persists as the mapping form ``{"enabled": ..., "wordlist": ...}``
+    (``core/config.py::WebConfig._content_discovery_section``). A plain boolean
+    ``content_discovery`` gate is *enabled but unapproved*: the FFUF adapter is
+    fail-closed without a wordlist, so proposing a fuzz task for it would only
+    schedule a run that must refuse. Only the approved mapping form triggers the
+    ``content_discover`` child.
+    """
+    if not isinstance(config, dict):
+        return False
+    web = config.get("web")
+    if not isinstance(web, dict):
+        return False
+    cd = web.get("content_discovery")
+    if not isinstance(cd, dict):
+        return False
+    if not cd.get("enabled", True):
+        return False
+    wordlist = cd.get("wordlist")
+    return isinstance(wordlist, str) and bool(wordlist.strip())
 
 
 def plan_discovery_expansion(
@@ -220,6 +249,25 @@ def plan_discovery_expansion(
                         )
                     elif "katana" in allowed:
                         proposals.append(("katana", seed, None, _crawl_reuse_reason(seed)))
+            # Phase 23: discover content on the probed app. The canonical child type
+            # is ``content_discover``; when the composition only registered the
+            # ``ffuf`` spelling, a ffuf-typed task is proposed instead (same dedup
+            # key, never both). The seed is the app's own recorded URL, exactly like
+            # the crawl, and ``reason`` carries it back to the adapter; the child is
+            # proposed only when the run approved a wordlist, because the adapter is
+            # fail-closed without one.
+            preferred_cd = allowed & {"content_discover", "ffuf"}
+            if preferred_cd and _approved_content_discovery(config):
+                seed = _crawl_seed(artifact)
+                key = (CHILD_TYPE_CONTENT_DISCOVER, seed)
+                if key not in seen:
+                    seen.add(key)
+                    if CHILD_TYPE_CONTENT_DISCOVER in allowed:
+                        proposals.append(
+                            (CHILD_TYPE_CONTENT_DISCOVER, seed, None, _crawl_reuse_reason(seed))
+                        )
+                    elif "ffuf" in allowed:
+                        proposals.append(("ffuf", seed, None, _crawl_reuse_reason(seed)))
 
     ordered = sorted(proposals, key=lambda item: (item[0], item[1]))
     limit = max(0, int(max_tasks))

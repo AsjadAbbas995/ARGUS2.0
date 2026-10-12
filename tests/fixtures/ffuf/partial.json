@@ -1,0 +1,5 @@
+{"host": "www.example.com:8080", "status": 200, "url": "http://www.example.com:8080/login"}
+broken fragment
+{"results": [{"status": 301, "url": "http://www.example.com:8080/old"}]}
+{"url": "ftp://www.example.com/ignored", "status": 200}
+{"status": 200}

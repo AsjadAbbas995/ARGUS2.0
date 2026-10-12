@@ -1,0 +1,10 @@
+{
+  "commandline": "ffuf -u http://www.example.com:8080/FUZZ -w wordlist.txt -json",
+  "time": "2026-01-01T00:00:00Z",
+  "results": [
+    {"input": {"FUZZ": "login"}, "position": 1, "status": 200, "length": 187, "url": "http://www.example.com:8080/login"},
+    {"input": {"FUZZ": "admin"}, "position": 2, "status": 403, "length": 11, "url": "http://www.example.com:8080/admin"},
+    {"input": {"FUZZ": "robots.txt"}, "position": 3, "status": 200, "length": 99, "url": "http://www.example.com:8080/robots.txt"},
+    {"input": {"FUZZ": "api"}, "position": 4, "status": 200, "length": 5, "url": "http://www.example.com:8080/api"}
+  ]
+}

@@ -169,16 +169,59 @@ class WebConfig:
     crawling: bool = True
     content_discovery: bool = True
     historical_urls: bool = True
+    content_discovery_wordlist: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "WebConfig":
         data = data or {}
+        cd = data.get("content_discovery")
+        if isinstance(cd, dict):
+            enabled = bool(cd.get("enabled", True))
+            raw_wordlist = cd.get("wordlist")
+        else:
+            enabled = bool(cd if cd is not None else True)
+            raw_wordlist = data.get("content_discovery_wordlist")
+        wordlist = None
+        if raw_wordlist is not None and str(raw_wordlist).strip():
+            if not isinstance(raw_wordlist, str):
+                raise ConfigError(
+                    "config.web.content_discovery.wordlist must be a path string"
+                )
+            wordlist = raw_wordlist.strip()
+            path = Path(wordlist)
+            if not path.is_file():
+                raise ConfigError(
+                    f"config.web.content_discovery.wordlist must reference an existing "
+                    f"file: {wordlist!r}"
+                )
+            if not os.access(path, os.R_OK):
+                raise ConfigError(
+                    f"config.web.content_discovery.wordlist must be readable: {wordlist!r}"
+                )
         return cls(
             http_probe=bool(data.get("http_probe", True)),
             crawling=bool(data.get("crawling", True)),
-            content_discovery=bool(data.get("content_discovery", True)),
+            content_discovery=enabled,
             historical_urls=bool(data.get("historical_urls", True)),
+            content_discovery_wordlist=wordlist,
         )
+
+    def _content_discovery_section(self) -> dict[str, Any]:
+        """The ``web.content_discovery`` snapshot section for ``to_dict``.
+
+        Emitted as the plain boolean gate when no wordlist is approved, and as a
+        mapping carrying the approved local path when one is (the path is the
+        authoritative approval record, so it must survive into the snapshot the
+        run reproduces from -- ``02_ARCHITECTURE.md`` ``runs.configuration_snapshot``).
+        """
+        if self.content_discovery_wordlist:
+            return {
+                "content_discovery": {
+                    "enabled": self.content_discovery,
+                    "wordlist": self.content_discovery_wordlist,
+                }
+            }
+        return {"content_discovery": self.content_discovery}
 
 
 @dataclass(frozen=True)
@@ -401,8 +444,8 @@ class Config:
             "web": {
                 "http_probe": self.web.http_probe,
                 "crawling": self.web.crawling,
-                "content_discovery": self.web.content_discovery,
                 "historical_urls": self.web.historical_urls,
+                **self.web._content_discovery_section(),
             },
             "javascript": {
                 "deep_analysis": self.javascript.deep_analysis,
@@ -511,8 +554,8 @@ def run_snapshot_from_dict(data: dict[str, Any] | None) -> dict[str, Any]:
         "web": {
             "http_probe": web.http_probe,
             "crawling": web.crawling,
-            "content_discovery": web.content_discovery,
             "historical_urls": web.historical_urls,
+            **web._content_discovery_section(),
         },
         "api": {
             "rest": api.rest,

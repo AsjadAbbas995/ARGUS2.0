@@ -5,7 +5,15 @@ from pathlib import Path
 
 import pytest
 
-from core.config import AiMode, Config, ConfigError, LimitsConfig, TcpPortRange
+from core.config import (
+    AiMode,
+    Config,
+    ConfigError,
+    LimitsConfig,
+    TcpPortRange,
+    WebConfig,
+    run_snapshot_from_dict,
+)
 
 MINIMAL_YAML = """
 database:
@@ -165,3 +173,147 @@ def test_missing_file_raises(tmp_path: Path) -> None:
 def test_invalid_yaml_raises(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="invalid YAML"):
         Config.load(write_config(tmp_path, "database: [unclosed\n"))
+
+
+# -- web.content_discovery.wordlist (Phase 23) --------------------------------
+
+
+def test_wordlist_defaults_to_unapproved(tmp_path: Path) -> None:
+    cfg = Config.load(write_config(tmp_path, MINIMAL_YAML))
+    assert cfg.web.content_discovery is True
+    assert cfg.web.content_discovery_wordlist is None
+
+
+def test_wordlist_bool_gate_form_still_parses(tmp_path: Path) -> None:
+    text = """
+database:
+  url: postgresql://u:p@localhost:5432/argus
+web:
+  content_discovery: false
+"""
+    cfg = Config.load(write_config(tmp_path, text))
+    assert cfg.web.content_discovery is False
+    assert cfg.web.content_discovery_wordlist is None
+
+
+def test_wordlist_mapping_form_with_approved_path(tmp_path: Path) -> None:
+    wordlist = tmp_path / "words.txt"
+    wordlist.write_text("/admin\n/api\n", encoding="utf-8")
+    text = f"""
+database:
+  url: postgresql://u:p@localhost:5432/argus
+web:
+  content_discovery:
+    enabled: true
+    wordlist: {wordlist}
+"""
+    cfg = Config.load(write_config(tmp_path, text))
+    assert cfg.web.content_discovery is True
+    assert cfg.web.content_discovery_wordlist == str(wordlist)
+
+
+def test_wordlist_mapping_form_defaults_enabled(tmp_path: Path) -> None:
+    wordlist = tmp_path / "words.txt"
+    wordlist.write_text("/admin\n", encoding="utf-8")
+    text = f"""
+database:
+  url: postgresql://u:p@localhost:5432/argus
+web:
+  content_discovery:
+    wordlist: {wordlist}
+"""
+    cfg = Config.load(write_config(tmp_path, text))
+    assert cfg.web.content_discovery is True
+    assert cfg.web.content_discovery_wordlist == str(wordlist)
+
+
+def test_wordlist_empty_and_null_are_unapproved(tmp_path: Path) -> None:
+    for blank in ('wordlist: ""', "wordlist:"):
+        text = f"""
+database:
+  url: postgresql://u:p@localhost:5432/argus
+web:
+  content_discovery:
+    enabled: true
+    {blank}
+"""
+        cfg = Config.load(write_config(tmp_path, text))
+        assert cfg.web.content_discovery_wordlist is None
+
+
+def test_wordlist_missing_file_fails_closed(tmp_path: Path) -> None:
+    text = """
+database:
+  url: postgresql://u:p@localhost:5432/argus
+web:
+  content_discovery:
+    enabled: true
+    wordlist: C:/definitely/not/here.txt
+"""
+    with pytest.raises(ConfigError, match="wordlist"):
+        Config.load(write_config(tmp_path, text))
+
+
+def test_wordlist_non_string_fails_closed(tmp_path: Path) -> None:
+    text = """
+database:
+  url: postgresql://u:p@localhost:5432/argus
+web:
+  content_discovery:
+    enabled: true
+    wordlist: [a, b]
+"""
+    with pytest.raises(ConfigError, match="wordlist"):
+        Config.load(write_config(tmp_path, text))
+
+
+def test_wordlist_disabled_gate_still_requires_a_valid_path(tmp_path: Path) -> None:
+    # Fail-closed: even with the gate off, a present-but-invalid path is rejected.
+    text = """
+database:
+  url: postgresql://u:p@localhost:5432/argus
+web:
+  content_discovery:
+    enabled: false
+    wordlist: C:/definitely/not/here.txt
+"""
+    with pytest.raises(ConfigError, match="wordlist"):
+        Config.load(write_config(tmp_path, text))
+
+
+def test_wordlist_render_roundtrips_through_the_snapshot(tmp_path: Path) -> None:
+    wordlist = tmp_path / "words.txt"
+    wordlist.write_text("/admin\n", encoding="utf-8")
+    cfg = Config.load(write_config(tmp_path, MINIMAL_YAML))
+    data = dict(cfg.to_dict())
+    data["web"] = {
+        "content_discovery": {"enabled": True, "wordlist": str(wordlist)},
+    }
+    rebuilt = Config.from_dict(data)
+    assert rebuilt.web.content_discovery_wordlist == str(wordlist)
+
+
+def test_wordlist_snapshot_emits_bool_when_unapproved(tmp_path: Path) -> None:
+    snapshot = run_snapshot_from_dict(Config().to_dict())
+    assert snapshot["web"]["content_discovery"] is True
+
+
+def test_wordlist_snapshot_emits_the_approved_path(tmp_path: Path) -> None:
+    wordlist = tmp_path / "words.txt"
+    wordlist.write_text("/admin\n", encoding="utf-8")
+    payload = {
+        "scope": {"allowed_domains": ["example.com"]},
+        "web": {"content_discovery": {"enabled": True, "wordlist": str(wordlist)}},
+    }
+    snapshot = run_snapshot_from_dict(payload)
+    assert snapshot["web"]["content_discovery"] == {
+        "enabled": True,
+        "wordlist": str(wordlist),
+    }
+
+
+def test_wordlist_config_requires_explicit_approval_for_direct_construction(
+    tmp_path: Path,
+) -> None:
+    # The dataclass itself remains a plain value: approval is an intake-time check.
+    assert WebConfig(content_discovery_wordlist=None).content_discovery_wordlist is None

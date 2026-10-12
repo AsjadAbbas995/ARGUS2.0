@@ -54,6 +54,7 @@ from recon.ingest import plan_ingestion
 from recon.normalize import normalize_hostname
 from recon.ports.nmap import NmapAdapter
 from recon.subdomains.subfinder import SubfinderAdapter
+from recon.web.ffuf import FfufAdapter
 from recon.web.httpx_probe import HttpxProbeAdapter
 from recon.web.katana import KatanaAdapter
 from recon.web.tech_detect import TechDetectAdapter
@@ -89,6 +90,13 @@ DEFAULT_PORT_SCAN_TYPES: tuple[str, ...] = ("port_scan", "nmap")
 #: spellings dispatch to the same Katana adapter, keeping the served registry and the
 #: coverage computation consistent.
 DEFAULT_WEB_CRAWL_TYPES: tuple[str, ...] = ("web_crawl", "katana")
+#: Phase 23: approved-wordlist content discovery. ``content_discover`` is the
+#: documented stage name the AI layer already reports
+#: (``ai.run_context.TASK_TYPE_COVERS_STAGE``); the ``ffuf`` spelling is registered
+#: alongside it so the served registry and the coverage computation stay consistent.
+#: Do **not** remap ``web_crawl`` here: crawling and content discovery are distinct
+#: stages, and the suite asserts they stay separate.
+DEFAULT_CONTENT_DISCOVER_TYPES: tuple[str, ...] = ("content_discover", "ffuf")
 
 
 class ServeConfigurationError(RuntimeError):
@@ -353,6 +361,12 @@ def _default_adapters(
     # ``TechDetectAdapter``. A task type outside this table is refused upstream.
     adapters.update(
         {kind: KatanaAdapter for kind in DEFAULT_WEB_CRAWL_TYPES}
+    )
+    # Phase 23: approved-wordlist content discovery. ``FfufAdapter`` is in-process
+    # and stdlib-only (the fuzz binary is a controlled subprocess at execution time),
+    # so the class is used directly as its own factory, matching Phase 22.
+    adapters.update(
+        {kind: FfufAdapter for kind in DEFAULT_CONTENT_DISCOVER_TYPES}
     )
     return adapters
 

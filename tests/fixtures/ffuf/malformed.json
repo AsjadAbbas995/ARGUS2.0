@@ -1,0 +1,5 @@
+{"status": 200, "url": "http://www.example.com:8080/valid"}
+this is not json at all
+{"status": 200}
+{"status": 403, "url": "http://www.example.com:8080/also-valid"}
+{ "url": "ftp://www.example.com/ignored", "status": 200 }

@@ -124,6 +124,9 @@ TASK_TYPE_FOR_STAGE: Mapping[str, str] = {
     "port_scan": "port_scan",
     "http_probe": "http_probe",
     "tech_detect": "tech_detect",
+    # Phase 23: approved-wordlist content discovery. The canonical task type
+    # registered in the served adapter registry, dispatched by the loop's planner.
+    "content_discover": "content_discover",
 }
 
 #: ``input_context_ref`` prefix. The ``ai_analysis`` table has no ``run_id`` column, so run

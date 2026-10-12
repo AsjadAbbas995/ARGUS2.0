@@ -493,9 +493,9 @@ class TestServedComposition:
     def test_the_gate_excludes_every_stage_without_an_adapter(self):
         orch = _served_orchestrator(True)
         # Phase 20A registered Subfinder and Nmap adapters; Phase 21A registered
-        # the served ``tech_detect`` adapter, so every stage with a served adapter
-        # is translatable into a runnable task type. Only stages that still lack an
-        # adapter must not be runnable.
+        # the served ``tech_detect`` and Phase 23 ``content_discover`` adapters, so
+        # every stage with a served adapter is translatable into a runnable task
+        # type. Only stages that still lack an adapter must not be runnable.
         covered = frozenset(
             {
                 "dns_resolve",
@@ -503,6 +503,7 @@ class TestServedComposition:
                 "subdomain_enum",
                 "port_scan",
                 "tech_detect",
+                "content_discover",
             }
         )
         for stage, task_type in ai_loop.TASK_TYPE_FOR_STAGE.items():

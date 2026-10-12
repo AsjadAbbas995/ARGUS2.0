@@ -19,6 +19,7 @@ from core.scope_guard import ScopeConfig, ScopeGuard
 from database.models.entities import Task
 from recon.dns.resolver import IpObservation
 from recon.expansion import (
+    CHILD_TYPE_CONTENT_DISCOVER,
     CHILD_TYPE_DNS,
     CHILD_TYPE_HTTP_PROBE,
     CHILD_TYPE_PORT_SCAN,
@@ -490,3 +491,137 @@ def test_duplicate_web_apps_propose_one_crawl_task() -> None:
         available_types=TYPES_WITH_CRAWL,
     )
     assert len([t for t in tasks if t.type == CHILD_TYPE_WEB_CRAWL]) == 1
+
+
+# -- mapping: web app -> content_discover / ffuf (Phase 23) ---------------------
+
+
+TYPES_WITH_DISCOVER = TYPES_WITH_CRAWL + ("content_discover",)
+
+_APPROVED_DISCOVERY_CONFIG = {
+    "web": {"content_discovery": {"enabled": True, "wordlist": "/tmp/words.txt"}}
+}
+
+
+def test_web_app_observation_with_approved_wordlist_implies_content_discover() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [_web_app(port=443)],
+        parent=parent,
+        available_types=TYPES_WITH_DISCOVER,
+        config=_APPROVED_DISCOVERY_CONFIG,
+    )
+    assert _types(tasks) == {"tech_detect", "web_crawl", "content_discover"}
+    assert _targets(tasks, CHILD_TYPE_CONTENT_DISCOVER) == ["https://www.example.com:443/"]
+
+
+def test_content_discover_target_uses_the_recorded_app_url() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [
+            WebAppObservation(
+                host="www.example.com",
+                url="https://www.example.com/",
+                scheme="https",
+                port=443,
+                status_code=200,
+            )
+        ],
+        parent=parent,
+        available_types=TYPES_WITH_DISCOVER,
+        config=_APPROVED_DISCOVERY_CONFIG,
+    )
+    assert _targets(tasks, CHILD_TYPE_CONTENT_DISCOVER) == ["https://www.example.com/"]
+
+
+def test_content_discover_reason_carries_the_seed_url_for_reuse() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [_web_app(port=8080)],
+        parent=parent,
+        available_types=TYPES_WITH_DISCOVER,
+        config=_APPROVED_DISCOVERY_CONFIG,
+    )
+    discoverer = next(t for t in tasks if t.type == CHILD_TYPE_CONTENT_DISCOVER)
+    assert json.loads(discoverer.reason or "{}") == {"url": discoverer.target}
+
+
+def test_ffuf_spelling_proposes_one_ffuf_task() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [_web_app(port=443)],
+        parent=parent,
+        available_types=TYPES_WITH_TECH + ("ffuf",),
+        config=_APPROVED_DISCOVERY_CONFIG,
+    )
+    assert _types(tasks) == {"tech_detect", "ffuf"}
+    assert _targets(tasks, "ffuf") == ["https://www.example.com:443/"]
+
+
+def test_content_discover_and_ffuf_never_both_propose() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [_web_app(port=443)],
+        parent=parent,
+        available_types=TYPES_WITH_TECH + ("content_discover", "ffuf"),
+        config=_APPROVED_DISCOVERY_CONFIG,
+    )
+    discoverers = [t for t in tasks if t.type in ("content_discover", "ffuf")]
+    assert len(discoverers) == 1
+    assert discoverers[0].type == "content_discover"
+
+
+def test_content_discover_requires_an_approved_wordlist() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    # The plain boolean gate is *enabled but unapproved*: no wordlist -> the child
+    # is never proposed, because the FFUF adapter is fail-closed without one.
+    no_config = _expand(
+        [_web_app(port=443)],
+        parent=parent,
+        available_types=TYPES_WITH_DISCOVER,
+    )
+    assert "content_discover" not in _types(no_config)
+    enabled_only = _expand(
+        [_web_app(port=443)],
+        parent=parent,
+        available_types=TYPES_WITH_DISCOVER,
+        config={"web": {"content_discovery": True}},
+    )
+    assert _types(enabled_only) == {"tech_detect", "web_crawl"}
+
+
+def test_content_discover_honors_the_disabled_mapping_gate() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [_web_app(port=443)],
+        parent=parent,
+        available_types=TYPES_WITH_DISCOVER,
+        config={
+            "web": {
+                "content_discovery": {"enabled": False, "wordlist": "/tmp/words.txt"}
+            }
+        },
+    )
+    assert "content_discover" not in _types(tasks)
+
+
+def test_content_discover_is_blocked_when_not_allowlisted() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [_web_app(port=443)],
+        parent=parent,
+        available_types=TYPES_WITH_CRAWL,
+        config=_APPROVED_DISCOVERY_CONFIG,
+    )
+    assert _types(tasks) == {"tech_detect", "web_crawl"}
+
+
+def test_duplicate_web_apps_propose_one_content_discover_task() -> None:
+    parent = _parent(target="www.example.com", task_type="http_probe")
+    tasks = _expand(
+        [_web_app(port=443), _web_app(port=443)],
+        parent=parent,
+        available_types=TYPES_WITH_DISCOVER,
+        config=_APPROVED_DISCOVERY_CONFIG,
+    )
+    assert len([t for t in tasks if t.type == CHILD_TYPE_CONTENT_DISCOVER]) == 1

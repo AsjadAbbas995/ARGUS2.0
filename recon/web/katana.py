@@ -58,8 +58,8 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Any, Mapping, Optional
 from urllib.parse import parse_qsl, urlparse
 
 from core.scope_guard import ScopeGuard
@@ -83,11 +83,17 @@ _MODE_ARGS = ("-jsonl", "-js-crawl")
 
 @dataclass(frozen=True)
 class UrlObservation:
-    """One normalized crawl URL (path only; query belongs to parameters)."""
+    """One normalized crawl URL (path only; query belongs to parameters).
+
+    ``metadata`` carries additive per-observation signal (Phase 23: the FFUF
+    result's HTTP status code). It is deliberately excluded from ``key`` so the
+    canonical identity of a URL never depends on metadata.
+    """
 
     host: str
     port: int
     path: str
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def key(self) -> tuple:
@@ -96,12 +102,16 @@ class UrlObservation:
 
 @dataclass(frozen=True)
 class EndpointObservation:
-    """One crawled HTTP endpoint (method verbatim from the record)."""
+    """One crawled HTTP endpoint (method verbatim from the record).
+
+    ``metadata`` mirrors :attr:`UrlObservation.metadata` (Phase 23: FFUF status).
+    """
 
     host: str
     port: int
     path: str
     method: str = "GET"
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def key(self) -> tuple:
