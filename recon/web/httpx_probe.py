@@ -41,11 +41,20 @@ class WebAppObservation:
     content_type: str = ""
 
 
+#: The category an observation is recorded with when nothing explicit was
+#: detected. Mirrors ``recon.ingest.DEFAULT_TECHNOLOGY_CATEGORY``; the value is
+#: restated here because the ingestion layer imports these dataclasses and the
+#: direction must stay acyclic. Phase 21A lets a detector pass an explicit
+#: category through; everything else stays the honest ``"other"``.
+DEFAULT_TECHNOLOGY_CATEGORY = "other"
+
+
 @dataclass(frozen=True)
 class TechnologyObservation:
     """A single detected technology (``05_DATA_MODEL.md`` §technologies)."""
 
     name: str
+    category: str = DEFAULT_TECHNOLOGY_CATEGORY
 
 
 @dataclass(frozen=True)
@@ -54,6 +63,7 @@ class AssetTechnologyObservation:
 
     host: str
     technology: str
+    category: str = DEFAULT_TECHNOLOGY_CATEGORY
 
 
 #: Field names httpx emits under ``-json`` mode.
