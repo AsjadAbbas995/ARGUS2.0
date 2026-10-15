@@ -20,7 +20,7 @@ treat as "no proposal".
 
 Coverage gaps are intersected with capability
 --------------------------------------------
-``recon_agent.STAGE_PRIORITY`` names 17 documented recon stages. Only some have a registered
+``recon_agent.STAGE_PRIORITY`` names 18 documented recon stages. Only some have a registered
 adapter, and ``api/serve.py`` refuses a task type with no adapter *before* constructing one, so
 proposing an unexecutable stage would not merely waste a pass -- it would enqueue a task that
 fails immediately.
@@ -76,6 +76,12 @@ TASK_TYPE_COVERS_STAGE: Mapping[str, str] = {
     # spelling, so a task of either type satisfies the same stage.
     "content_discover": "content_discover",
     "ffuf": "content_discover",
+    # Phase 24: passive historical URL discovery. ``historical_recon`` is the stage
+    # name and the canonical task type; ``gau`` is the adapter's tool spelling, so a
+    # task of either type satisfies the same stage. ``wayback`` joins with the deferred
+    # follow-up.
+    "historical_recon": "historical_recon",
+    "gau": "historical_recon",
 }
 
 #: Terminal task statuses that mean the stage actually produced coverage. A task that is still

@@ -19,6 +19,7 @@ from recon.ingest import (
     plan_ingestion,
 )
 from recon.ports.nmap import PortObservation
+from recon.historical import HistoricalUrlObservation
 from recon.web.httpx_probe import (
     AssetTechnologyObservation,
     TechnologyObservation,
@@ -307,6 +308,112 @@ def test_duplicate_crawl_observations_collapse() -> None:
 def test_crawl_facts_make_a_plan_non_empty() -> None:
     assert plan([UrlObservation(host="www.example.com", port=80, path="/")]).is_empty is False
     assert plan([]).is_empty is True
+
+
+# -- historical facts (Phase 24) ------------------------------------------------
+
+
+def test_historical_observation_yields_a_historical_url_plan() -> None:
+    result = plan(
+        [
+            HistoricalUrlObservation(
+                host="www.example.com",
+                port=8080,
+                path="/old/api",
+                url="http://www.example.com:8080/old/api",
+                source="gau",
+            )
+        ]
+    )
+    assert [(u.hostname, u.port, u.path, u.historical) for u in result.urls] == [
+        ("www.example.com", 8080, "/old/api", True)
+    ]
+
+
+def test_live_url_observation_yields_a_non_historical_plan() -> None:
+    result = plan([UrlObservation(host="www.example.com", port=8080, path="/live")])
+    assert [u.historical for u in result.urls] == [False]
+
+
+def test_historical_observation_for_an_out_of_scope_host_is_not_promoted() -> None:
+    result = plan(
+        [
+            HistoricalUrlObservation(
+                host="evil.example.org",
+                port=80,
+                path="/",
+                url="http://evil.example.org/",
+                source="gau",
+            )
+        ]
+    )
+    assert result.urls == ()
+    assert [o.value for o in result.out_of_scope] == ["evil.example.org"]
+
+
+def test_duplicate_historical_observations_collapse() -> None:
+    result = plan(
+        [
+            HistoricalUrlObservation(
+                host="www.example.com", port=8080, path="/a", url="http://x/a", source="gau"
+            ),
+            HistoricalUrlObservation(
+                host="www.example.com", port=8080, path="/a", url="http://x/a", source="gau"
+            ),
+        ]
+    )
+    assert len(result.urls) == 1
+    assert result.urls[0].historical is True
+
+
+def test_historical_then_live_observation_keeps_the_url_live() -> None:
+    # Order independence: a live observation must not be lost when a historical
+    # observation of the same path was seen first. Live clears ``historical``, per
+    # the ``urls`` upsert truth table.
+    result = plan(
+        [
+            HistoricalUrlObservation(
+                host="www.example.com", port=8080, path="/a", url="http://x/a", source="gau"
+            ),
+            UrlObservation(host="www.example.com", port=8080, path="/a"),
+        ]
+    )
+    assert [(u.hostname, u.port, u.path, u.historical) for u in result.urls] == [
+        ("www.example.com", 8080, "/a", False)
+    ]
+
+
+def test_live_then_historical_observation_keeps_the_url_live() -> None:
+    # The reverse ordering resolves identically: live wins regardless of order, so
+    # the persisted historical flag never depends on which observation arrived first.
+    result = plan(
+        [
+            UrlObservation(host="www.example.com", port=8080, path="/a"),
+            HistoricalUrlObservation(
+                host="www.example.com", port=8080, path="/a", url="http://x/a", source="gau"
+            ),
+        ]
+    )
+    assert [(u.hostname, u.port, u.path, u.historical) for u in result.urls] == [
+        ("www.example.com", 8080, "/a", False)
+    ]
+
+
+def test_two_historical_observations_stay_historical() -> None:
+    # Without any live observation the URL stays historical, whichever providers
+    # reported it.
+    result = plan(
+        [
+            HistoricalUrlObservation(
+                host="www.example.com", port=8080, path="/a", url="http://x/a", source="gau"
+            ),
+            HistoricalUrlObservation(
+                host="www.example.com", port=8080, path="/a", url="http://x/a", source="wayback"
+            ),
+        ]
+    )
+    assert [u.historical for u in result.urls] == [True]
+
 
 
 # -- normalization ----------------------------------------------------------

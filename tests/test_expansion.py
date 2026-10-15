@@ -18,6 +18,7 @@ import pytest
 from core.scope_guard import ScopeConfig, ScopeGuard
 from database.models.entities import Task
 from recon.dns.resolver import IpObservation
+from recon.historical import HistoricalUrlObservation
 from recon.expansion import (
     CHILD_TYPE_CONTENT_DISCOVER,
     CHILD_TYPE_DNS,
@@ -625,3 +626,58 @@ def test_duplicate_web_apps_propose_one_content_discover_task() -> None:
         config=_APPROVED_DISCOVERY_CONFIG,
     )
     assert len([t for t in tasks if t.type == CHILD_TYPE_CONTENT_DISCOVER]) == 1
+
+
+# -- mapping: historical URL is passive, never expanded (Phase 24) ---------------
+
+
+def test_historical_url_observation_never_proposes_a_probe() -> None:
+    # A passively discovered historical URL must not cause active probing of a host
+    # that may no longer exist. ``plan_discovery_expansion`` has no branch for
+    # ``HistoricalUrlObservation``, so it is inert -- this is the acceptance guard.
+    parent = _parent(target="example.com", task_type="historical_recon")
+    tasks = _expand(
+        [
+            HistoricalUrlObservation(
+                host="www.example.com",
+                port=443,
+                path="/old/admin",
+                url="https://www.example.com/old/admin",
+                source="gau",
+            )
+        ],
+        parent=parent,
+        available_types=TYPES_WITH_TECH
+        + ("web_crawl", "katana", "content_discover", "ffuf", "historical_recon", "gau"),
+    )
+    assert tasks == []
+    assert "http_probe" not in _types(tasks)
+
+
+def test_historical_run_expands_to_nothing_even_when_all_children_allowed() -> None:
+    parent = _parent(target="example.com", task_type="historical_recon")
+    tasks = _expand(
+        [
+            HistoricalUrlObservation(
+                host="api.example.com",
+                port=8080,
+                path="/v1/legacy",
+                url="http://api.example.com:8080/v1/legacy",
+                source="gau",
+            )
+        ],
+        parent=parent,
+        available_types=(
+            "dns_resolve",
+            "port_scan",
+            "http_probe",
+            "tech_detect",
+            "web_crawl",
+            "katana",
+            "content_discover",
+            "ffuf",
+            "historical_recon",
+            "gau",
+        ),
+    )
+    assert _types(tasks) == set()

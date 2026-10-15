@@ -168,7 +168,10 @@ class WebConfig:
     http_probe: bool = True
     crawling: bool = True
     content_discovery: bool = True
-    historical_urls: bool = True
+    #: Phase 24: historical recon reaches into third-party archives (and, in the
+    #: deferred follow-up, could lead to active probing), so its gate fails closed:
+    #: the default is disabled and enablement is an explicit operator opt-in.
+    historical_urls: bool = False
     content_discovery_wordlist: str | None = None
 
     @classmethod
@@ -202,7 +205,7 @@ class WebConfig:
             http_probe=bool(data.get("http_probe", True)),
             crawling=bool(data.get("crawling", True)),
             content_discovery=enabled,
-            historical_urls=bool(data.get("historical_urls", True)),
+            historical_urls=bool(data.get("historical_urls", False)),
             content_discovery_wordlist=wordlist,
         )
 

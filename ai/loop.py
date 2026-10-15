@@ -163,6 +163,9 @@ TASK_TYPE_FOR_STAGE: Mapping[str, str] = {
     # Phase 23: approved-wordlist content discovery. The canonical task type
     # registered in the served adapter registry, dispatched by the loop's planner.
     "content_discover": "content_discover",
+    # Phase 24: passive historical URL discovery. The canonical task type registered in
+    # the served adapter registry (gated on ``web.historical_urls``).
+    "historical_recon": "historical_recon",
 }
 
 #: ``input_context_ref`` prefix. The ``ai_analysis`` table has no ``run_id`` column, so run

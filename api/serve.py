@@ -50,6 +50,7 @@ from database.models.entities import ToolRun
 from recon.base import ToolAdapter
 from recon.dns.resolver import DnsResolverAdapter, make_resolver
 from recon.expansion import plan_discovery_expansion
+from recon.historical.gau import GauAdapter
 from recon.ingest import plan_ingestion
 from recon.normalize import normalize_hostname
 from recon.ports.nmap import NmapAdapter
@@ -97,6 +98,13 @@ DEFAULT_WEB_CRAWL_TYPES: tuple[str, ...] = ("web_crawl", "katana")
 #: Do **not** remap ``web_crawl`` here: crawling and content discovery are distinct
 #: stages, and the suite asserts they stay separate.
 DEFAULT_CONTENT_DISCOVER_TYPES: tuple[str, ...] = ("content_discover", "ffuf")
+#: Phase 24: passive historical URL discovery (GAU). ``historical_recon`` is the
+#: documented stage name the AI layer reports
+#: (``ai.run_context.TASK_TYPE_COVERS_STAGE``); ``gau`` is the adapter's tool spelling.
+#: These types are registered **only** when ``web.historical_urls`` is true -- the gate
+#: is fail-closed and defaults to disabled, so the stage resolves to
+#: ``uncovered_without_capability`` rather than a failing task when it is off.
+DEFAULT_HISTORICAL_TYPES: tuple[str, ...] = ("historical_recon", "gau")
 
 
 class ServeConfigurationError(RuntimeError):
@@ -317,7 +325,7 @@ def _effective_config(config: Optional[Config], database_url: str) -> Config:
 
 
 def _default_adapters(
-    resolver_fn, dns_timeout: float
+    resolver_fn, dns_timeout: float, config: Optional[Config] = None
 ) -> dict[str, Callable[[], ToolAdapter]]:
     """Build the default task-type -> adapter table.
 
@@ -327,6 +335,10 @@ def _default_adapters(
 
     ``resolver_fn`` is the test/dev injection point for DNS answers; production uses
     ``make_resolver`` (dnspython-style resolution through the standard library).
+
+    ``config`` is the resolved run configuration. Historical recon (Phase 24) is
+    registered **only** when ``config.web.historical_urls`` is true; a missing config
+    (``None``) is treated as disabled (fail-closed), matching the documented default.
     """
     def dns() -> ToolAdapter:
         return DnsResolverAdapter(
@@ -368,6 +380,14 @@ def _default_adapters(
     adapters.update(
         {kind: FfufAdapter for kind in DEFAULT_CONTENT_DISCOVER_TYPES}
     )
+    # Phase 24: passive historical URL discovery. Registered only behind the explicit
+    # ``web.historical_urls`` opt-in, so a disabled gate leaves no GAU-capable type in
+    # the registry (the coverage loop then reports the stage as uncovered-without-
+    # capability instead of enqueuing a task that would be refused).
+    if config is not None and config.web.historical_urls:
+        adapters.update(
+            {kind: GauAdapter for kind in DEFAULT_HISTORICAL_TYPES}
+        )
     return adapters
 
 
@@ -572,7 +592,7 @@ def create_serve_app(
         raw_dir=Path(effective_config.storage.raw_dir)
     )
 
-    default_adapters = _default_adapters(resolver_fn, dns_timeout)
+    default_adapters = _default_adapters(resolver_fn, dns_timeout, effective_config)
     if adapters:
         default_adapters.update(adapters)
 

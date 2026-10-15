@@ -397,6 +397,7 @@ def build_records(facts: RunFacts) -> tuple[Any, ...]:
             path=str(row.get("path", "")),
             source=str(row.get("source") or ""),
             evidence_id=evidence_id,
+            historical=bool(row.get("historical")),
         )
         records.append(url_records[row["id"]])
 

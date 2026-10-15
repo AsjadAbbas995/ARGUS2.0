@@ -1,0 +1,6 @@
+{"url": "https://www.example.com/old/api/v1/users"}
+{"url": "http://www.example.com:8080/legacy/panel?debug=1"}
+{"url": "https://example.com/"}
+{"url": "ftp://www.example.com/file"}
+{"url": "https://www.example.com/old/api/v1/users"}
+{"not-a-url": true}

@@ -1,0 +1,6 @@
+{"url": "https://www.example.com/good"}
+{ this is not json }
+{"url": 
+https://www.example.com/plain-line
+{"url": "http://www.example.com:8080/also-good"}
+not-a-url-at-all

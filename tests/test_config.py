@@ -317,3 +317,11 @@ def test_wordlist_config_requires_explicit_approval_for_direct_construction(
 ) -> None:
     # The dataclass itself remains a plain value: approval is an intake-time check.
     assert WebConfig(content_discovery_wordlist=None).content_discovery_wordlist is None
+
+
+def test_historical_urls_defaults_disabled_fail_closed() -> None:
+    # Phase 24: historical recon is an explicit opt-in; the gate (and its snapshot)
+    # defaults to False so the stage is never enabled by omission.
+    assert WebConfig().historical_urls is False
+    assert WebConfig.from_dict({}).historical_urls is False
+    assert run_snapshot_from_dict({})["web"]["historical_urls"] is False

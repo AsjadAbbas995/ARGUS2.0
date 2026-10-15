@@ -26,6 +26,7 @@ STAGE_PRIORITY = (
     "tech_detect",
     "web_crawl",
     "content_discover",
+    "historical_recon",
     "js_analysis",
     "api_discover",
     "openapi_schema",

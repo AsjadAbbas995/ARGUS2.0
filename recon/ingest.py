@@ -27,6 +27,7 @@ from typing import Any, Optional, Sequence
 
 from core.scope_guard import ScopeGuard
 from recon.dns.resolver import DnsRecordObservation, IpObservation
+from recon.historical import HistoricalUrlObservation
 from recon.normalize import normalize_hostname
 from recon.ports.nmap import PortObservation
 from recon.web.httpx_probe import (
@@ -158,11 +159,17 @@ class OutOfScopeObservation:
 
 @dataclass(frozen=True)
 class UrlPlan:
-    """One ``urls`` row for an in-scope host (path, source = plan source tool)."""
+    """One ``urls`` row for an in-scope host (path, source = plan source tool).
+
+    ``historical`` is **required** (no default) so no caller can silently promote a
+    URL by omission: a passive historical observation always sets ``True`` and a live
+    observation always sets ``False`` (Phase 24).
+    """
 
     hostname: str
     port: int
     path: str
+    historical: bool
 
 
 @dataclass(frozen=True)
@@ -287,8 +294,9 @@ def plan_ingestion(
     seen_tech: set[tuple[str, str]] = set()
     ports: list[PortPlan] = []
     seen_ports: set[tuple[str, int, str]] = set()
-    urls: list[UrlPlan] = []
-    seen_url: set[tuple[str, int, str]] = set()
+    # One entry per (host, port, path); the value is the URL's *resolved* historical
+    # flag. Insertion order is preserved, so the plan order stays deterministic.
+    url_historical: dict[tuple[str, int, str], bool] = {}
     endpoints: list[EndpointPlan] = []
     seen_endpoint: set[tuple[str, int, str, str]] = set()
     parameters: list[ParameterPlan] = []
@@ -414,12 +422,26 @@ def plan_ingestion(
                     )
                 )
         elif isinstance(artifact, UrlObservation):
+            # A live observation of a URL wins over any historical observation of the
+            # same (host, port, path): the persisted ``historical`` is ``True`` only
+            # while *every* observation of the URL is historical, matching the ``urls``
+            # upsert truth table (``database/repositories/all.py``
+            # ``UrlRepository.upsert``). Resolving here -- rather than keeping the first
+            # observation seen -- makes the result independent of input order, so a live
+            # URL is never recorded as historical merely because a historical
+            # observation of the same path was processed first.
             host = classify_host(artifact.host)
             if host is not None:
-                key = (host, artifact.port, artifact.path)
-                if key not in seen_url:
-                    seen_url.add(key)
-                    urls.append(UrlPlan(hostname=host, port=artifact.port, path=artifact.path))
+                url_historical[(host, artifact.port, artifact.path)] = False
+        elif isinstance(artifact, HistoricalUrlObservation):
+            # Passive historical discovery (Phase 24): a distinct type so the flag is
+            # carried by the observation itself. The URL is marked historical and is
+            # never expanded into an active probe downstream. ``setdefault`` keeps an
+            # existing live flag (``False``) so a historical re-observation cannot
+            # downgrade a URL that was also seen live.
+            host = classify_host(artifact.host)
+            if host is not None:
+                url_historical.setdefault((host, artifact.port, artifact.path), True)
         elif isinstance(artifact, EndpointObservation):
             host = classify_host(artifact.host)
             if host is not None:
@@ -467,7 +489,10 @@ def plan_ingestion(
         web_apps=tuple(web_apps),
         technologies=tuple(technologies),
         ports=tuple(ports),
-        urls=tuple(urls),
+        urls=tuple(
+            UrlPlan(hostname=host, port=port, path=path, historical=historical)
+            for (host, port, path), historical in url_historical.items()
+        ),
         endpoints=tuple(endpoints),
         parameters=tuple(parameters),
         javascript_files=tuple(javascript_files),

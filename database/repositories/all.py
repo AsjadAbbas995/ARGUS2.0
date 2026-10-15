@@ -500,12 +500,22 @@ class WebAppRepository(BaseRepository):
 
 
 class UrlRepository(BaseRepository):
-    def upsert(self, web_app_id, path: str, source: str) -> dict:
+    def upsert(self, web_app_id, path: str, source: str, historical: bool) -> dict:
+        # Phase 24: ``historical`` is ANDed on conflict so a URL is only historical
+        # while *every* observation of it has been historical. A live observation of
+        # the same (web_app_id, path) clears the flag and takes over ``source``; a
+        # historical re-observation of an already-live URL leaves the live source.
         cur = self.conn.execute(
-            "INSERT INTO urls (web_app_id, path, source) VALUES (%s, %s, %s) "
-            "ON CONFLICT (web_app_id, path) DO UPDATE SET source = EXCLUDED.source "
+            "INSERT INTO urls (web_app_id, path, source, historical) "
+            "VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (web_app_id, path) DO UPDATE SET "
+            "historical = urls.historical AND EXCLUDED.historical, "
+            "source = CASE "
+            "WHEN NOT EXCLUDED.historical THEN EXCLUDED.source "
+            "WHEN urls.historical THEN EXCLUDED.source "
+            "ELSE urls.source END "
             "RETURNING *",
-            (web_app_id, path, source),
+            (web_app_id, path, source, historical),
         )
         return cur.fetchone()
 
@@ -1258,7 +1268,7 @@ class Repositories(Storage):
             if app_id is None:
                 _evidence(ENTITY_URL)
                 continue
-            row = self.urls.upsert(app_id, url.path, crawl_source)
+            row = self.urls.upsert(app_id, url.path, crawl_source, url.historical)
             _evidence(ENTITY_URL, row["id"])
             url_ids[(url.hostname, url.port, url.path)] = row["id"]
 

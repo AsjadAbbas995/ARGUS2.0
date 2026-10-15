@@ -77,6 +77,7 @@ class UrlRecord:
     path: str
     source: str
     evidence_id: str
+    historical: bool = False
 
     @property
     def key(self) -> str:

@@ -41,22 +41,33 @@ def runner(tmp_path: Path) -> ToolRunner:
 
 
 def test_uses_shell_false_never_shell_true(monkeypatch, runner: ToolRunner) -> None:
+    import io
+
     captured: dict = {}
 
-    def fake_run(args, **kwargs):
-        captured["args"] = args
-        captured["kwargs"] = kwargs
+    class FakePopen:
+        def __init__(self, args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            self.returncode = 0
+            self.pid = 4242
+            self.stdout = io.BytesIO(b"")
+            self.stderr = io.BytesIO(b"")
 
-        class Proc:
-            returncode = 0
-            stdout = ""
-            stderr = ""
+        def poll(self):
+            return 0
 
-        return Proc()
+        def wait(self, timeout=None):
+            return 0
 
-    monkeypatch.setattr("core.tool_runner.subprocess.run", fake_run)
+        def kill(self):
+            pass
+
+    monkeypatch.setattr("core.tool_runner.subprocess.Popen", FakePopen)
     runner.run_command([PY, "-c", "pass"], tool="fake")
     assert "shell" in captured["kwargs"] and captured["kwargs"]["shell"] is False
+    assert captured["kwargs"]["stdout"] is not None
+    assert captured["kwargs"]["stderr"] is not None
 
 
 def test_command_is_argument_array_never_shell_string(runner: ToolRunner) -> None:

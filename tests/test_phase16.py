@@ -222,6 +222,27 @@ class TestCoverageGaps:
             [_task("katana")], executable
         )
 
+    def test_a_historical_task_type_covers_the_historical_stage(self):
+        # Phase 24: a completed ``gau`` (tool spelling) or ``historical_recon``
+        # (canonical) task satisfies the ``historical_recon`` stage.
+        executable = self.EXEC + ("historical_recon", "gau")
+        assert "historical_recon" in run_context.coverage_gaps([], executable)
+        assert "historical_recon" not in run_context.coverage_gaps(
+            [_task("gau")], executable
+        )
+        assert "historical_recon" not in run_context.coverage_gaps(
+            [_task("historical_recon")], executable
+        )
+
+    def test_historical_recon_without_capability_is_reported_not_proposed(self):
+        # With the gate disabled (no adapter registered) the stage is named as
+        # "we could not", never enqueued.
+        blocked = run_context.uncovered_without_capability([], self.EXEC)
+        assert "historical_recon" in blocked
+
+    def test_the_historical_stage_resolves_to_its_canonical_task_type(self):
+        assert ai_loop.TASK_TYPE_FOR_STAGE["historical_recon"] == "historical_recon"
+
     def test_uncovered_without_capability_reports_the_rest(self):
         blocked = run_context.uncovered_without_capability([], self.EXEC)
         assert "subdomain_enum" in blocked
