@@ -35,6 +35,7 @@ def render(report: Mapping[str, Any]) -> str:
         "<h1>ARGUS Run Report</h1>\n",
         _facts_section(report),
         _ai_analysis_section(report),
+        _ai_coverage_gaps_section(report),
         _hypotheses_section(report),
         _findings_section(report),
         _evidence_section(report),
@@ -93,6 +94,41 @@ def _ai_analysis_item(item: Mapping[str, Any]) -> str:
     if created:
         out.append("<br/>created_at={0}".format(escape(created)))
     out.append("</li>\n")
+    return "".join(out)
+
+
+def _ai_coverage_gaps_section(report: Mapping[str, Any]) -> str:
+    """Render the run's persisted coverage gaps, or nothing when absent.
+
+    Phase 18. Absent key means no coverage storage; empty list means none. Both follow
+    the optional-section convention.
+    """
+    gaps = report.get("ai_coverage_gaps")
+    if not isinstance(gaps, list):
+        return ""
+    out: list[str] = ["<section id=\"ai_coverage_gaps\">\n", "<h2>AI Coverage Gaps</h2>\n"]
+    if not gaps:
+        out.append("<p>No coverage gaps recorded.</p>\n")
+        out.append("</section>\n")
+        return "".join(out)
+    out.append("<ul>\n")
+    for g in gaps:
+        if not isinstance(g, Mapping):
+            continue
+        stage = escape(str(g.get("stage") or ""))
+        if not stage:
+            continue
+        count = escape(str(g.get("observation_count") or 1))
+        first = escape(str(g.get("first_seen_at") or ""))
+        last = escape(str(g.get("last_seen_at") or ""))
+        out.append("<li><strong>{0}</strong> (observed {1} time(s))".format(stage, count))
+        if first:
+            out.append("<br/>first_seen_at={0}".format(first))
+        if last:
+            out.append("<br/>last_seen_at={0}".format(last))
+        out.append("</li>\n")
+    out.append("</ul>\n")
+    out.append("</section>\n")
     return "".join(out)
 
 

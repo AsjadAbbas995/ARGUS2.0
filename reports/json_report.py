@@ -20,6 +20,7 @@ _FINDINGS_SECTION = "validated_findings"
 _EVIDENCE_SECTION = "evidence"
 _ATTACK_SURFACE_SECTION = "attack_surface"
 _AI_ANALYSIS_SECTION = "ai_analysis"
+_AI_COVERAGE_GAPS_SECTION = "ai_coverage_gaps"
 
 _PRIORITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "none": 4}
 
@@ -63,6 +64,7 @@ def build_report(
     evidence: Iterable[Evidence] = (),
     attack_surface: Optional[Mapping[str, Any]] = None,
     ai_analysis: Optional[Iterable[Mapping[str, Any]]] = None,
+    ai_coverage_gaps: Optional[Iterable[Mapping[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Build the full report dict for ``run``.
 
@@ -116,6 +118,13 @@ def build_report(
         report[_AI_ANALYSIS_SECTION] = [
             _normalise(a) for a in sorted(ai_analysis, key=_ai_analysis_key)
         ]
+    if ai_coverage_gaps is not None:
+        # Stable order by stage, then id as tie-break to be deterministic.
+        gaps = sorted(
+            ai_coverage_gaps,
+            key=lambda g: (str(g.get("stage") or ""), str(g.get("id") or "")),
+        )
+        report[_AI_COVERAGE_GAPS_SECTION] = [_normalise(g) for g in gaps]
     return report
 
 

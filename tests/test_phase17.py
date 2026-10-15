@@ -318,6 +318,7 @@ def test_every_reported_status_is_from_the_bounded_vocabulary():
         ANALYSIS_NO_PROPOSALS,
         ANALYSIS_PROPOSED,
         ANALYSIS_PASS_FAILED,
+        "coverage_unavailable",
     }
 
 

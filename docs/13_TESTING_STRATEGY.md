@@ -31,6 +31,53 @@ Verify: inserts, relationships (foreign keys resolve correctly), deduplication c
 (`05_DATA_MODEL.md` unique constraints), migrations (apply and roll back cleanly), and error
 handling on constraint violations.
 
+## PostgreSQL Live-Test Fixture
+
+Database tests are split in two. Everything above runs with no database at all. The PostgreSQL-backed
+tiers — the `*_live.py` modules — are gated on `ARGUS_TEST_DATABASE_URL` and **skip** when it is
+unset, so an ordinary checkout runs the whole suite offline and the live tiers opt in by setting
+that variable.
+
+That variable points at a **local live-test PostgreSQL fixture**. This is a test fixture only. It
+exists so PostgreSQL-backed integration and live verification have something real to run against,
+and it is **not production infrastructure**.
+
+| Property | Value |
+|---|---|
+| PostgreSQL version | 17.11 |
+| Cluster location | `Temp\opencode\pg15` (`%LOCALAPPDATA%\Temp\opencode\pg15`) |
+| Live-test port | `5433` |
+| Role | `argus` |
+| Database | `argus_test` |
+| Authentication | `trust`, loopback only |
+
+Start and stop it around a live run:
+
+```text
+pg_ctl -D %LOCALAPPDATA%\Temp\opencode\pg15 -l pg15run.log -o "-p 5433 -h 127.0.0.1" -w start
+set ARGUS_TEST_DATABASE_URL=postgresql://argus@127.0.0.1:5433/argus_test
+pytest
+set ARGUS_TEST_DATABASE_URL=
+pg_ctl -D %LOCALAPPDATA%\Temp\opencode\pg15 -m fast stop
+```
+
+**Do not confuse this fixture with the installed PostgreSQL cluster on port 5432.** They are
+separate clusters with different roles and different authentication:
+
+| | Live-test fixture | Installed cluster |
+|---|---|---|
+| Port | `5433` | `5432` |
+| Role `argus` | present | absent |
+| Authentication | `trust`, loopback only | `scram-sha-256` |
+
+Port 5432 is an unrelated installation and is **not** the live-test target. Phase verification has
+no credential for it and must not reconfigure, reload, or stop it. If a live run appears to need
+port 5432, the fixture on 5433 is not running.
+
+No password or secret belongs in this fixture, in `ARGUS_TEST_DATABASE_URL`, or in any tracked
+file. The fixture is `trust`-authenticated precisely so that none is needed; that is a property of a
+disposable local fixture and is not a precedent for anything reachable from outside this machine.
+
 ## Scope Tests
 
 ```text

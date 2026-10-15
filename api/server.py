@@ -279,6 +279,32 @@ def _analysis_diagnostics(app, orchestrator: Orchestrator) -> Mapping[str, objec
     }
 
 
+def _ai_coverage_gap_payload(gap) -> Mapping[str, object]:
+    """Project a persisted ``AiCoverageGap`` row onto the operator wire contract.
+
+    The fields returned are the real columns of the ``ai_coverage_gaps`` table, never
+    inferred values, and never sanitized beyond converting non-string values to their
+    string forms for ids. ``run_id`` is required on every persisted gap, so it is always
+    returned as a string here. Timestamps are passed through as-is (``created_at`` etc.)
+    the same way other dataclass fields are serialized.
+    """
+    return {
+        "id": str(getattr(gap, "id", "")),
+        "run_id": str(getattr(gap, "run_id", "")),
+        "stage": str(getattr(gap, "stage", "")),
+        "first_seen_at": getattr(gap, "first_seen_at", None).isoformat()
+        if getattr(getattr(gap, "first_seen_at", None), "isoformat", None)
+        else getattr(gap, "first_seen_at", None),
+        "last_seen_at": getattr(gap, "last_seen_at", None).isoformat()
+        if getattr(getattr(gap, "last_seen_at", None), "isoformat", None)
+        else getattr(gap, "last_seen_at", None),
+        "observation_count": int(getattr(gap, "observation_count", 1) or 1),
+        "created_at": getattr(gap, "created_at", None).isoformat()
+        if getattr(getattr(gap, "created_at", None), "isoformat", None)
+        else getattr(gap, "created_at", None),
+    }
+
+
 def _has_program_scope_rules(orchestrator: Orchestrator) -> bool:
     """Whether the orchestrator's storage exposes the authoritative ``scope_rules``.
 
@@ -748,6 +774,7 @@ def create_app(orchestrator: Orchestrator, api_key: str) -> FastAPI:
             evidence=evidence,
             attack_surface=surface,
             ai_analysis=[_ai_analysis_payload(row) for row in ai_analysis],
+            ai_coverage_gaps=[_ai_coverage_gap_payload(g) for g in _read_from_storage(orchestrator, "list_coverage_gaps", run_id)],
         )
         if fmt == "json":
             return PlainTextResponse(json_report.render(report), media_type="application/json")
@@ -809,6 +836,29 @@ def create_app(orchestrator: Orchestrator, api_key: str) -> FastAPI:
                 "count": len(rows),
                 "ai_analysis": [_ai_analysis_payload(row) for row in rows],
                 "diagnostics": _analysis_diagnostics(app, orchestrator),
+            }
+        )
+
+    @app.get("/api/v1/runs/{run_id}/ai-coverage-gaps", dependencies=[Depends(_authed)])
+    def list_ai_coverage_gaps(run_id: UUID) -> JSONResponse:
+        """The run's persisted coverage gaps: stages that no registered adapter can run.
+
+        Phase 18. Read-only, run-scoped, and authenticated by the same ``_authed``
+        dependency as every other route. ``_require_run`` raises 404 for unknown runs
+        before any read, so the route cannot be used to distinguish "run does not exist"
+        from "run has no gaps". The storage read is optional (duck-typed): a storage with
+        no Phase 18 support degrades to an honest empty list rather than raising.
+
+        These are reported-only: a gap is a statement about capability, never a task and
+        never a hypothesis, and nothing here enqueues work.
+        """
+        _require_run(orchestrator, run_id)
+        gaps = _read_from_storage(orchestrator, "list_coverage_gaps", run_id)
+        return JSONResponse(
+            {
+                "run_id": str(run_id),
+                "count": len(gaps),
+                "ai_coverage_gaps": [_ai_coverage_gap_payload(g) for g in gaps],
             }
         )
 

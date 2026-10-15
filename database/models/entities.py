@@ -199,6 +199,45 @@ class AiAnalysis:
 
 
 @dataclass
+class AiCoverageGap:
+    """One reconnaissance stage this run structurally could not attempt
+    (``ai_coverage_gaps`` table).
+
+    Phase 15 introduced :func:`ai.run_context.uncovered_without_capability` to keep
+    two facts apart: a stage left uncovered even though an adapter for it exists, and a
+    stage left uncovered because *no* registered adapter can run it. Phase 16 kept the
+    second kind out of proposals -- a gap the system cannot act on is not a task --
+    and deferred persisting it, because the table to store it in did not exist.
+
+    Phase 18 (migration ``0006``) creates that table, so the distinction survives
+    process exit and is readable per run.
+
+    This is deliberately NOT an :class:`AiAnalysis` row. An analysis row is one agent
+    invocation whose ``output`` is the verbatim contract object; a coverage gap is a
+    property of the run's capability surface that exists even on a pass which
+    proposed nothing. Folding gaps into ``ai_analysis`` would make "the AI ran and
+    proposed nothing" indistinguishable from "the AI ran and recorded a gap".
+
+    ``run_id`` is required, not optional. There is no legacy data for this table and
+    no honest way to attribute a historical gap, so nothing needs to be nullable to
+    accommodate an unattributable row.
+
+    One row per ``(run_id, stage)``: a gap seen on several passes is one fact about the
+    run. ``observation_count`` and ``last_seen_at`` keep the pass count from being lost
+    in that collapse -- ``count == 1`` is a stable capability gap, while a climbing
+    count is a signal that the gap is being re-planned every pass.
+    """
+
+    id: UUID = field(default_factory=_uuid)
+    run_id: Optional[UUID] = None
+    stage: str = ""
+    first_seen_at: Optional[datetime] = None
+    last_seen_at: Optional[datetime] = None
+    observation_count: int = 1
+    created_at: Optional[datetime] = None
+
+
+@dataclass
 class Hypothesis:
     id: UUID = field(default_factory=_uuid)
     run_id: UUID = field(default_factory=_uuid)

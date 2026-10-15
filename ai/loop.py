@@ -40,6 +40,28 @@ are not part of that guarantee -- Phase 14 already established that ``entity_id`
 trusted from tool output, and the same rule applies to what an agent proposes. See
 ``PHASE_16_PROPOSAL.md`` §2.2 for why real model backends are deferred.
 
+Phase 18
+--------
+Phase 18 persists what Phase 15 computes and Phase 16 deferred: the reconnaissance
+stages a run structurally could not attempt, because no registered adapter can run them
+(:func:`ai.run_context.uncovered_without_capability`). Those gaps now go to
+``ai_coverage_gaps`` (migration ``0006``) via the same duck-typed optional seam
+``insert_ai_analysis`` uses, so the Phase 15 distinction survives process exit and is
+readable per run.
+
+Three properties matter here:
+
+* **Reported, never proposed.** A gap is not a task and not a hypothesis. Nothing in
+  this phase enqueues one, and ``validate``/``_task_from`` are untouched.
+* **Never silently dropped.** A storage without the Phase 18 write, or a failing
+  write, logs and records :data:`ANALYSIS_COVERAGE_UNAVAILABLE` rather than passing
+  quietly -- a silently dropped coverage gap would be the exact failure this phase
+  exists to prevent, which is why "fail closed" here means "loudly and without
+  partial writes", not "quietly".
+* **It cannot lose proposals.** Gap recording happens after the proposal loop and in
+  its own transaction, so a gap-write failure leaves every ``ai_analysis`` row and
+  hypothesis already committed exactly as they were.
+
 Phase 17
 --------
 Phase 17 changes persistence attribution and observability only; the agents, the contract,
@@ -97,6 +119,19 @@ ANALYSIS_NO_PROPOSALS = "no_proposals"
 ANALYSIS_PROPOSED = "proposed"
 ANALYSIS_PASS_FAILED = "pass_failed"
 
+#: Phase 18. The pass ran and reached its conclusion, but the coverage gaps it observed
+#: could not be persisted -- either the storage has no Phase 18 write, or the write raised.
+#:
+#: This is deliberately a *distinct* state rather than a silent success. A coverage gap that
+#: vanishes without a trace is the precise failure Phase 18 exists to prevent: the run would
+#: look complete while the record of what it could not attempt disappeared. It is not
+#: :data:`ANALYSIS_CAPABILITY_UNAVAILABLE`, because that one means the pass never reached the
+#: agents at all -- here the pass genuinely ran and produced its analysis.
+#:
+#: It never carries the exception detail, for the same reason the other statuses do not: the
+#: message stays in the log and the API client sees a coarse state.
+ANALYSIS_COVERAGE_UNAVAILABLE = "coverage_unavailable"
+
 #: Every state :attr:`AnalysisResult.status` can hold. Bounded so a caller cannot be
 #: handed an unexpected string, and so the diagnostic vocabulary stays greppable.
 ANALYSIS_STATUSES = frozenset(
@@ -106,6 +141,7 @@ ANALYSIS_STATUSES = frozenset(
         ANALYSIS_NO_PROPOSALS,
         ANALYSIS_PROPOSED,
         ANALYSIS_PASS_FAILED,
+        ANALYSIS_COVERAGE_UNAVAILABLE,
     }
 )
 
@@ -285,16 +321,33 @@ class AnalysisHook:
                     if task is not None and self._persist(outcome, run_id):
                         proposed.append(task)
 
+            # Phase 18. Computed once and recorded before the result is built, so the
+            # persisted rows and the value reported on ``last_result`` cannot disagree.
+            gaps = uncovered_without_capability(tasks, sorted(self.runnable))
+            coverage_ok = self._record_coverage_gaps(run_id, gaps)
+
             self.last_result = AnalysisResult(
                 outcomes=tuple(o for o in outcomes if o.proposal is not None or o.error),
                 tasks=tuple(proposed),
-                uncovered_without_capability=uncovered_without_capability(
-                    tasks, sorted(self.runnable)
-                ),
+                uncovered_without_capability=gaps,
                 # "ran and proposed" is measured by what was actually persisted, not by
                 # whether an agent returned something: a proposal that failed validation or
                 # could not be persisted proposed no new work.
-                status=ANALYSIS_PROPOSED if proposed or hypotheses_written else ANALYSIS_NO_PROPOSALS,
+                #
+                # Phase 18: a coverage-gap write failure outranks that distinction. The
+                # pass really did produce its analysis, but the record of what it could not
+                # attempt is missing, and an operator reading only this field must be able
+                # to tell that from a clean pass -- hence ANALYSIS_COVERAGE_UNAVAILABLE
+                # rather than a silent NO_PROPOSALS.
+                status=(
+                    ANALYSIS_COVERAGE_UNAVAILABLE
+                    if not coverage_ok
+                    else (
+                        ANALYSIS_PROPOSED
+                        if proposed or hypotheses_written
+                        else ANALYSIS_NO_PROPOSALS
+                    )
+                ),
             )
             return proposed
         except Exception as exc:
@@ -317,6 +370,43 @@ class AnalysisHook:
                 error=f"{type(exc).__name__}: {exc}",
             )
             return []
+
+    def _record_coverage_gaps(self, run_id: UUID, gaps: Sequence[str]) -> bool:
+        """Persist the coverage gaps observed this pass.
+
+        Phase 18. One row per stage, deduplicated per ``(run_id, stage)``; the storage's
+        ``observe_coverage_gaps`` advances ``last_seen_at`` and ``observation_count`` on
+        conflict. The caller passes the tuple returned by
+        :func:`ai.run_context.uncovered_without_capability` verbatim, so no change to how gaps
+        are computed is made here.
+
+        The return value is ``False`` only when a gap was supposed to be recorded but could
+        not. That is a deliberate signal: the pass must not silently drop the gap. In that
+        case the method logs the condition, and the caller promotes the result status to
+        :data:`ANALYSIS_COVERAGE_UNAVAILABLE` rather than returning ``ANALYSIS_NO_PROPOSALS``.
+        """
+        if not gaps:
+            return True
+        recorder = getattr(self.storage, "observe_coverage_gaps", None)
+        if not callable(recorder):
+            log.warning(
+                "coverage gaps were observed for run %s but storage %s has no "
+                "observe_coverage_gaps method; gaps are NOT persisted",
+                run_id,
+                type(self.storage).__name__,
+            )
+            return False
+        try:
+            recorder(run_id, tuple(gaps))
+        except Exception as exc:
+            log.warning(
+                "coverage gap persistence failed for run %s: %s: %s",
+                run_id,
+                type(exc).__name__,
+                exc,
+            )
+            return False
+        return True
 
     # -- internals -------------------------------------------------------------
 

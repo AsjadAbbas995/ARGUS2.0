@@ -27,6 +27,10 @@
   var aiList = document.getElementById("aiList");
   var aiEmpty = document.getElementById("aiEmpty");
   var aiDiag = document.getElementById("aiDiag");
+  var gapSec = document.getElementById("aiCoverageGaps");
+  var gapList = document.getElementById("gapList");
+  var gapEmpty = document.getElementById("gapEmpty");
+  var gapDiag = document.getElementById("gapDiag");
   var runTitleAnalysis = document.getElementById("currentRunAnalysis");
 
   var apiKey = "";
@@ -105,10 +109,12 @@
     runTitleAnalysis.textContent = "Run " + runId;
     hySec.hidden = false;
     aiSec.hidden = false;
+    if (gapSec) { gapSec.hidden = false; }
     request("GET", "/runs/" + runId + "/hypotheses")
       .then(renderHypotheses)
       .catch(function (e) { warn(e.message); });
     loadAiAnalysis(runId);
+    loadCoverageGaps(runId);
   }
 
   /* The AI panel is supplementary: a failure to read it must never disturb the
@@ -248,6 +254,47 @@
     p.textContent = "recorded: " + payload.review_status + (payload.review_reason ? " -- " + payload.review_reason : "");
     card.appendChild(p);
     clearWarn();
+  }
+
+  function loadCoverageGaps(runId) {
+    if (!gapList || !gapDiag || !gapEmpty) { return; }
+    gapList.innerHTML = "";
+    gapEmpty.hidden = true;
+    gapDiag.textContent = "Loading...";
+    request("GET", "/runs/" + runId + "/ai-coverage-gaps")
+      .then(renderCoverageGaps)
+      .catch(function (e) {
+        gapList.innerHTML = "";
+        gapDiag.textContent = "Coverage gaps unavailable: " + e.message;
+      });
+  }
+
+  function renderCoverageGaps(data) {
+    if (!gapList || !gapDiag || !gapEmpty) { return; }
+    gapList.innerHTML = "";
+    var items = data.ai_coverage_gaps || [];
+    gapEmpty.hidden = items.length > 0;
+    var parts = ["count: " + items.length];
+    gapDiag.textContent = parts.join(" -- ");
+    items.forEach(function (g) { gapList.appendChild(gapCard(g)); });
+  }
+
+  function gapCard(g) {
+    var card = document.createElement("article");
+    card.className = "card";
+    card.dataset.gapId = g.id;
+    var head = document.createElement("div");
+    head.className = "meta";
+    head.textContent = (g.stage || "unknown") + " -- observed " + (g.observation_count || 1) + " time(s)";
+    var meta = document.createElement("p");
+    meta.className = "meta";
+    var bits = [];
+    if (g.first_seen_at) { bits.push("first: " + g.first_seen_at); }
+    if (g.last_seen_at) { bits.push("last: " + g.last_seen_at); }
+    meta.textContent = bits.join(" -- ");
+    card.appendChild(head);
+    if (bits.length) { card.appendChild(meta); }
+    return card;
   }
 
   function boot() {

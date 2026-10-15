@@ -1,0 +1,21 @@
+-- ARGUS revert for migration 0006: drop the ``ai_coverage_gaps`` table.
+--
+-- Reverting discards every persisted coverage gap. That is a real loss -- the gap
+-- rows are the only record of which stages a run structurally could not attempt
+-- -- so this is a destructive revert by nature, exactly like ``0004`` reverting
+-- persisted adaptive-loop state. It is scoped as tightly as the table allows:
+--
+--   * the DROP is ``CASCADE``-free on purpose. ``ai_coverage_gaps`` is a leaf:
+--     nothing references it and it references only ``runs``. If a future migration
+--     ever adds a foreign key *into* this table, this revert will fail loudly
+--     rather than silently dropping the referencing table too.
+--   * ``runs`` is untouched. Reverting 0006 cannot orphan or delete a run.
+--   * ``ai_analysis`` is untouched. Migration 0005's run relationship and its
+--     rows are entirely independent of this table and survive the round trip.
+--
+-- Re-applying 0006 afterwards creates an empty table. There is no backfill and
+-- none is possible: gaps were never stored before 0006, so a re-apply cannot
+-- recover them and must not fabricate them. Coverage gaps for runs analysed while
+-- 0006 was reverted are genuinely lost, and the honest state after a re-apply is an
+-- empty gap set rather than an inferred one.
+DROP TABLE IF EXISTS ai_coverage_gaps;

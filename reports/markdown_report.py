@@ -35,6 +35,7 @@ _ASSETS = "assets"
 _RUN = "run"
 _ATTACK_SURFACE = "attack_surface"
 _AI_ANALYSIS = "ai_analysis"
+_AI_COVERAGE_GAPS = "ai_coverage_gaps"
 
 _LABELS = {"HYPOTHESIS", "UNVERIFIED_CLAIM", "VALIDATED_FINDING"}
 
@@ -55,6 +56,7 @@ def render(report: Mapping[str, Any]) -> str:
     parts: list[str] = [_TOP]
     parts.append(_facts_section(report))
     parts.append(_ai_analysis_section(report))
+    parts.append(_ai_coverage_gaps_section(report))
     parts.append(_hypotheses_section(report))
     parts.append(_findings_section(report))
     parts.append(_evidence_section(report))
@@ -214,6 +216,38 @@ def _ai_analysis_section(report: Mapping[str, Any]) -> str:
         created = _flat(a.get("created_at"))
         if created:
             out.append(f"  created_at={created}")
+    return "".join(out) + _DIVIDER
+
+
+def _ai_coverage_gaps_section(report: Mapping[str, Any]) -> str:
+    """Render the run's persisted coverage gaps, or nothing when absent.
+
+    Phase 18. The section is omitted entirely if the key is missing (caller has no
+    coverage storage), matching the optional-section convention of the attack surface
+    and AI analysis. An empty list means the run was analysed and has no gaps, which is
+    reported truthfully as "No coverage gaps recorded".
+    """
+    gaps = report.get(_AI_COVERAGE_GAPS)
+    if not isinstance(gaps, list):
+        return ""
+    out: list[str] = ["# AI Coverage Gaps\n"]
+    if not gaps:
+        out.append("_No coverage gaps recorded._\n")
+        return "".join(out) + _DIVIDER
+    for g in gaps:
+        if not isinstance(g, Mapping):
+            continue
+        stage = _flat(g.get("stage") or "")
+        if not stage:
+            continue
+        count = g.get("observation_count", 1)
+        first = _flat(g.get("first_seen_at"))
+        last = _flat(g.get("last_seen_at"))
+        out.append(f"- **{stage}** (observed {count} time(s))")
+        if first:
+            out.append(f"  first_seen_at={first}")
+        if last:
+            out.append(f"  last_seen_at={last}")
     return "".join(out) + _DIVIDER
 
 

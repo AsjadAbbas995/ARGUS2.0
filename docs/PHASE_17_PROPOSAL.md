@@ -281,6 +281,10 @@ The copy's `pg_hba.conf` is the only one that has ever granted `trust`. The prod
 `pg_hba.conf` was read to confirm it remains `scram-sha-256` on every line, and the production
 postmaster was never stopped, reloaded, or reconfigured.
 
+The sanctioned, canonical description of this fixture — location, role, database, how to start and
+stop it — is `13_TESTING_STRATEGY.md` §PostgreSQL Live-Test Fixture. This section records what Phase
+17 specifically observed; that section is what a contributor should read.
+
 ### 12.3 Behaviour worth knowing: analysis is one pass behind ingestion
 
 The served loop's analysis pass reads the projection **before** the pass's own task ingestion
