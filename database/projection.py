@@ -119,6 +119,7 @@ from correlation.records import (
 )
 from correlation.relationship_engine import Inference
 from correlation.relationship_engine import run as run_relationship_engine
+from recon import correlation
 from recon.ingest import (
     ENTITY_ASSET,
     ENTITY_DNS_RECORD,
@@ -252,6 +253,9 @@ class AttackSurface:
     #: the in-memory development double). Distinct from "available but empty", which is
     #: a real run that observed nothing.
     available: bool = True
+    #: Conservative endpoint/parameter correlation: groups by exact identity,
+    #: preserves all observations and evidence IDs. Not used by production consumers yet.
+    endpoint_correlations: tuple[Any, ...] = field(default_factory=tuple)
 
     def record_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -513,9 +517,17 @@ def project(run_id: Optional[UUID], facts: RunFacts) -> AttackSurface:
     facts exist the endpoint records are projected from real crawled endpoints, and any
     inference rule whose gate they genuinely satisfy fires; an empty inference result is
     still reported honestly rather than padded when no gate is met.
+
+    ``recon.correlation.correlate_endpoints`` is invoked as a conservative additional
+    grouping of endpoints and their parameters, preserving duplicate observations and
+    evidence IDs without collapsing them. This is not used by production consumers yet;
+    it is exposed so that future agents can reason over exactly what the projection
+    already encodes in the graph.
     """
     records = build_records(facts)
     graph = build_graph(records)
+    # conservative endpoint/parameter correlation: pure, read-only, no mutation
+    endpoint_correlations = correlation.correlate_endpoints(records)
     return AttackSurface(
         run_id=run_id,
         records=records,
@@ -524,6 +536,7 @@ def project(run_id: Optional[UUID], facts: RunFacts) -> AttackSurface:
         endpoint_graph=endpoint_subgraph(graph),
         evidence_counts=facts.evidence_counts,
         available=True,
+        endpoint_correlations=endpoint_correlations,
     )
 
 
@@ -533,6 +546,26 @@ def _node_payload(node: Node) -> dict[str, Any]:
         "kind": node.kind,
         "evidence_id": node.evidence_id,
         "attributes": {k: node.attributes[k] for k in sorted(node.attributes)},
+    }
+
+
+def _group_payload(g):
+    return {
+        "group_id": g.group_id,
+        "endpoint_key": g.endpoint_key,
+        "host": g.host,
+        "method": g.method,
+        "pattern": g.pattern,
+        "endpoint_observations": [
+            {"method": ep.method, "pattern": ep.pattern, "host": ep.host, "evidence_id": ep.evidence_id}
+            for ep in g.endpoints
+        ],
+        "parameter_observations": [
+            {"name": p.name, "location": p.location, "significance": p.significance,
+             "endpoint_key": p.endpoint_key, "evidence_id": p.evidence_id}
+            for p in g.parameters
+        ],
+        "evidence_ids": list(g.evidence_ids),
     }
 
 
@@ -599,6 +632,10 @@ def serialize(surface: AttackSurface) -> dict[str, Any]:
             ],
         },
         "unproduced_record_kinds": list(UNPRODUCED_RECORD_KINDS),
+        "endpoint_correlations": {
+            "count": len(surface.endpoint_correlations),
+            "items": [_group_payload(g) for g in surface.endpoint_correlations],
+        },
     }
 
 

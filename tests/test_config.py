@@ -9,6 +9,7 @@ from core.config import (
     AiMode,
     Config,
     ConfigError,
+    JavascriptConfig,
     LimitsConfig,
     TcpPortRange,
     WebConfig,
@@ -324,4 +325,38 @@ def test_historical_urls_defaults_disabled_fail_closed() -> None:
     # defaults to False so the stage is never enabled by omission.
     assert WebConfig().historical_urls is False
     assert WebConfig.from_dict({}).historical_urls is False
+
+
+# -- javascript.enabled (Phase 25) ---------------------------------------------
+
+
+def test_javascript_enabled_defaults_disabled_fail_closed() -> None:
+    # Phase 25: JavaScript analysis is an explicit opt-in. A config that predates
+    # the field, or omits it, loads disabled rather than enabling the stage.
+    assert JavascriptConfig().enabled is False
+    assert JavascriptConfig.from_dict({}).enabled is False
+    assert JavascriptConfig.from_dict({"deep_analysis": True, "source_maps": True}).enabled is False
+
+
+def test_javascript_enabled_is_read_from_dict() -> None:
+    cfg = Config.from_dict(
+        {
+            "database": {"url": "postgresql://u:p@localhost/argus"},
+            "javascript": {"enabled": True},
+        }
+    )
+    assert cfg.javascript.enabled is True
+
+
+def test_javascript_enabled_round_trips_through_to_dict() -> None:
+    section = Config(javascript=JavascriptConfig(enabled=True)).to_dict()["javascript"]
+    assert section == {"deep_analysis": True, "source_maps": True, "enabled": True}
+    assert JavascriptConfig.from_dict(section).enabled is True
+
+
+def test_run_snapshot_has_no_javascript_section() -> None:
+    # Phase 25 makes no change to ``run_snapshot_from_dict``: the persisted run
+    # snapshot carries no ``javascript`` section, so the gate is read only at
+    # adapter-registration time, never from the snapshot.
+    assert "javascript" not in run_snapshot_from_dict({})
     assert run_snapshot_from_dict({})["web"]["historical_urls"] is False

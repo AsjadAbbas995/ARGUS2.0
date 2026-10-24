@@ -166,6 +166,9 @@ TASK_TYPE_FOR_STAGE: Mapping[str, str] = {
     # Phase 24: passive historical URL discovery. The canonical task type registered in
     # the served adapter registry (gated on ``web.historical_urls``).
     "historical_recon": "historical_recon",
+    # Phase 25: JavaScript analysis. The canonical task type registered in the
+    # served adapter registry (gated on ``javascript.enabled``).
+    "js_analysis": "js_analysis",
 }
 
 #: ``input_context_ref`` prefix. The ``ai_analysis`` table has no ``run_id`` column, so run

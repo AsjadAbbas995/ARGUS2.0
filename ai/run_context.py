@@ -82,6 +82,9 @@ TASK_TYPE_COVERS_STAGE: Mapping[str, str] = {
     # follow-up.
     "historical_recon": "historical_recon",
     "gau": "historical_recon",
+    # Phase 25: JavaScript analysis. ``js_analysis`` is both the stage name and the
+    # canonical task type, so a task of that type satisfies the stage.
+    "js_analysis": "js_analysis",
 }
 
 #: Terminal task statuses that mean the stage actually produced coverage. A task that is still

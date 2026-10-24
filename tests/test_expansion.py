@@ -23,6 +23,7 @@ from recon.expansion import (
     CHILD_TYPE_CONTENT_DISCOVER,
     CHILD_TYPE_DNS,
     CHILD_TYPE_HTTP_PROBE,
+    CHILD_TYPE_JS_ANALYSIS,
     CHILD_TYPE_PORT_SCAN,
     CHILD_TYPE_TECH_DETECT,
     CHILD_TYPE_WEB_CRAWL,
@@ -30,6 +31,12 @@ from recon.expansion import (
 )
 from recon.ports.nmap import PortObservation
 from recon.web.httpx_probe import WebAppObservation
+from recon.web.katana import (
+    EndpointObservation,
+    JavascriptFileObservation,
+    ParameterObservation,
+    UrlObservation,
+)
 
 
 def _scope() -> ScopeGuard:
@@ -681,3 +688,97 @@ def test_historical_run_expands_to_nothing_even_when_all_children_allowed() -> N
         ),
     )
     assert _types(tasks) == set()
+
+
+# -- mapping: JavaScript file -> js_analysis (Phase 25) -------------------------
+
+
+TYPES_WITH_JS = TYPES_WITH_TECH + ("js_analysis",)
+
+
+def _js_file(
+    *,
+    host: str = "www.example.com",
+    port: int = 443,
+    url: str = "https://www.example.com/app.js",
+) -> JavascriptFileObservation:
+    return JavascriptFileObservation(host=host, port=port, url=url)
+
+
+def test_js_file_observation_implies_one_js_analysis_task() -> None:
+    parent = _parent(target="www.example.com", task_type="web_crawl")
+    tasks = _expand(
+        [_js_file()],
+        parent=parent,
+        available_types=TYPES_WITH_JS,
+    )
+    assert _types(tasks) == {CHILD_TYPE_JS_ANALYSIS}
+    child = next(t for t in tasks if t.type == CHILD_TYPE_JS_ANALYSIS)
+    assert child.target == "https://www.example.com/app.js"
+    assert child.run_id == parent.run_id
+    assert child.parent_task_id == parent.id
+
+
+def test_js_analysis_is_blocked_when_not_allowlisted() -> None:
+    # Disabled gate -> the type is absent from ``available_types`` -> no task.
+    tasks = _expand([_js_file()], available_types=TYPES_WITH_TECH)
+    assert CHILD_TYPE_JS_ANALYSIS not in _types(tasks)
+    assert tasks == []
+
+
+def test_duplicate_js_urls_propose_one_task() -> None:
+    tasks = _expand(
+        [_js_file(), _js_file()],
+        available_types=TYPES_WITH_JS,
+    )
+    assert len([t for t in tasks if t.type == CHILD_TYPE_JS_ANALYSIS]) == 1
+
+
+def test_out_of_scope_js_host_is_never_proposed() -> None:
+    tasks = _expand(
+        [_js_file(host="evil.example.org", url="https://evil.example.org/app.js")],
+        available_types=TYPES_WITH_JS,
+    )
+    assert tasks == []
+
+
+def test_distinct_js_urls_propose_distinct_tasks() -> None:
+    tasks = _expand(
+        [
+            _js_file(url="https://www.example.com/a.js"),
+            _js_file(url="https://www.example.com/b.js"),
+        ],
+        available_types=TYPES_WITH_JS,
+    )
+    assert _targets(tasks, CHILD_TYPE_JS_ANALYSIS) == [
+        "https://www.example.com/a.js",
+        "https://www.example.com/b.js",
+    ]
+
+
+def test_analyzer_output_observations_never_expand() -> None:
+    # No-probe / no-recursion guarantee: the analyzer emits only URL/endpoint/
+    # parameter observations, and none of them has an expansion branch, even when
+    # every task type -- including js_analysis itself -- is allowlisted.
+    all_types = TYPES_WITH_JS + (
+        "web_crawl",
+        "katana",
+        "content_discover",
+        "ffuf",
+        "historical_recon",
+        "gau",
+    )
+    tasks = _expand(
+        [
+            UrlObservation(host="www.example.com", port=443, path="/api/users"),
+            EndpointObservation(
+                host="www.example.com", port=443, path="/api/users", method="GET"
+            ),
+            ParameterObservation(
+                host="www.example.com", port=443, path="/api/users", name="id"
+            ),
+        ],
+        parent=_parent(target="https://www.example.com/app.js", task_type="js_analysis"),
+        available_types=all_types,
+    )
+    assert tasks == []

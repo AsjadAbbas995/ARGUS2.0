@@ -45,6 +45,7 @@ from recon.dns.resolver import IpObservation
 from recon.normalize import normalize_hostname
 from recon.ports.nmap import PortObservation
 from recon.web.httpx_probe import WebAppObservation
+from recon.web.katana import JavascriptFileObservation
 
 #: Task types this module may propose, keyed by the trigger artifact. The actual
 #: emission is still filtered by the caller's ``available_types`` allowlist.
@@ -54,6 +55,7 @@ CHILD_TYPE_HTTP_PROBE = "http_probe"
 CHILD_TYPE_TECH_DETECT = "tech_detect"
 CHILD_TYPE_WEB_CRAWL = "web_crawl"
 CHILD_TYPE_CONTENT_DISCOVER = "content_discover"
+CHILD_TYPE_JS_ANALYSIS = "js_analysis"
 
 #: Ports worth an HTTP probe. Deliberately conservative: a full "anything that
 #: might speak HTTP" list would fan out; these are the conventional clear-text and
@@ -268,6 +270,21 @@ def plan_discovery_expansion(
                         )
                     elif "ffuf" in allowed:
                         proposals.append(("ffuf", seed, None, _crawl_reuse_reason(seed)))
+        elif isinstance(artifact, JavascriptFileObservation):
+            # Phase 25: an already-crawled JavaScript file. The crawl persists only
+            # the JS URL (never its body), so the ``js_analysis`` adapter fetches it
+            # under the same scope/SSRF policy and extracts endpoints/parameters.
+            # The child is gated purely by ``available_types``: the adapter is
+            # registered only when ``config.javascript.enabled`` is set, so a
+            # disabled gate leaves this type absent and ``propose`` a no-op -- the
+            # expansion branch reads no config and needs no snapshot gate.
+            url = (getattr(artifact, "url", "") or "").strip()
+            host = normalize_hostname(getattr(artifact, "host", "")) or normalize_hostname(
+                extract_host(url)
+            )
+            if not url or not host or not scope.check_host(host).in_scope:
+                continue
+            propose(CHILD_TYPE_JS_ANALYSIS, url)
 
     ordered = sorted(proposals, key=lambda item: (item[0], item[1]))
     limit = max(0, int(max_tasks))

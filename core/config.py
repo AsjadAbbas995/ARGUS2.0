@@ -229,8 +229,24 @@ class WebConfig:
 
 @dataclass(frozen=True)
 class JavascriptConfig:
+    """JavaScript-analysis settings (``14_CONFIG_EXAMPLE.md`` ``javascript.*``).
+
+    ``enabled`` (Phase 25) defaults to **False**. It is the single opt-in switch
+    that decides whether ``api.serve._default_adapters`` registers the
+    ``js_analysis`` adapter, so it is fail-closed: an omitted key, a pre-Phase-25
+    config, or a ``None`` config all leave JavaScript analysis off, and the
+    coverage loop then reports the stage as uncovered-without-capability rather
+    than enqueuing a task that would be refused. The gate is read **only** at
+    adapter-registration time; expansion inherits it transitively through the
+    registered task types and does not read the config.
+
+    ``deep_analysis`` / ``source_maps`` are unchanged and remain unused this
+    phase (source-map analysis is a deferred follow-up).
+    """
+
     deep_analysis: bool = True
     source_maps: bool = True
+    enabled: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "JavascriptConfig":
@@ -238,6 +254,8 @@ class JavascriptConfig:
         return cls(
             deep_analysis=bool(data.get("deep_analysis", True)),
             source_maps=bool(data.get("source_maps", True)),
+            # Fail-closed: a config that predates this field loads disabled.
+            enabled=bool(data.get("enabled", False)),
         )
 
 
@@ -453,6 +471,7 @@ class Config:
             "javascript": {
                 "deep_analysis": self.javascript.deep_analysis,
                 "source_maps": self.javascript.source_maps,
+                "enabled": self.javascript.enabled,
             },
             "api": {
                 "rest": self.api.rest,

@@ -1,10 +1,10 @@
 """Step 3 tests.
 
 The conformance tests below require no live database: they statically verify
-that ``database/migrations/0001_initial_schema.sql`` and the entity models match
-the authoritative ``docs/05_DATA_MODEL.md`` table-for-table and
-column-for-column. Live-DB tests are conditional and skip when no PostgreSQL is
-reachable (see conftest.py).
+that the migration SQL (``0001_initial_schema.sql`` plus any table created by a
+later migration) and the entity models match the authoritative
+``docs/05_DATA_MODEL.md`` table-for-table and column-for-column. Live-DB tests
+are conditional and skip when no PostgreSQL is reachable (see conftest.py).
 """
 
 from __future__ import annotations
@@ -66,6 +66,7 @@ DOC_TABLES = [
     "tasks",
     "tool_runs",
     "ai_analysis",
+    "ai_coverage_gaps",
 ]
 
 DOC_COLUMNS: dict[str, list[str]] = {
@@ -162,6 +163,14 @@ DOC_COLUMNS: dict[str, list[str]] = {
         "output",
         "created_at",
     ],
+    "ai_coverage_gaps": [
+        "id",
+        "run_id",
+        "stage",
+        "first_seen_at",
+        "last_seen_at",
+        "observation_count",
+    ],
 }
 
 MODEL_CLASSES = {
@@ -185,14 +194,21 @@ MODEL_CLASSES = {
 }
 
 
-def _table_sql(text: str, table: str) -> str:
-    match = re.search(
-        rf"CREATE TABLE IF NOT EXISTS {table} \((.*?)\)\s*;",
-        text,
-        re.S,
-    )
-    assert match is not None, f"CREATE TABLE {table} not found"
-    return match.group(1)
+def _table_sql(table: str) -> str:
+    """Body of the ``CREATE TABLE`` for ``table``, from whichever migration defines it.
+
+    Most tables come from the initial schema, but tables added by later migrations
+    (e.g. ``ai_coverage_gaps``) are also found.
+    """
+    for path in migration_files():
+        match = re.search(
+            rf"CREATE TABLE IF NOT EXISTS {table} \((.*?)\)\s*;",
+            path.read_text(encoding="utf-8"),
+            re.S,
+        )
+        if match is not None:
+            return match.group(1)
+    raise AssertionError(f"CREATE TABLE {table} not found in any migration")
 
 
 def _columns_added_by_later_migrations(table: str) -> set[str]:
@@ -219,14 +235,15 @@ def _columns_added_by_later_migrations(table: str) -> set[str]:
 
 @pytest.mark.parametrize("table", DOC_TABLES)
 def test_every_documented_table_exists_in_sql(table: str) -> None:
-    sql = SQL_PATH.read_text(encoding="utf-8")
-    assert f"CREATE TABLE IF NOT EXISTS {table} (" in sql
+    for path in migration_files():
+        if f"CREATE TABLE IF NOT EXISTS {table} (" in path.read_text(encoding="utf-8"):
+            return
+    pytest.fail(f"{table} is documented but no migration creates it")
 
 
 @pytest.mark.parametrize("table", DOC_TABLES)
 def test_sql_has_exactly_documented_columns(table: str) -> None:
-    sql = SQL_PATH.read_text(encoding="utf-8")
-    fragment = _table_sql(sql, table)
+    fragment = _table_sql(table)
     expected = DOC_COLUMNS[table]
     defined = {
         name

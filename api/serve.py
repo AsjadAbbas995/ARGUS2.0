@@ -57,6 +57,7 @@ from recon.ports.nmap import NmapAdapter
 from recon.subdomains.subfinder import SubfinderAdapter
 from recon.web.ffuf import FfufAdapter
 from recon.web.httpx_probe import HttpxProbeAdapter
+from recon.web.js_analyze import JsAnalyzeAdapter, JsFetchBudget
 from recon.web.katana import KatanaAdapter
 from recon.web.tech_detect import TechDetectAdapter
 
@@ -105,6 +106,12 @@ DEFAULT_CONTENT_DISCOVER_TYPES: tuple[str, ...] = ("content_discover", "ffuf")
 #: is fail-closed and defaults to disabled, so the stage resolves to
 #: ``uncovered_without_capability`` rather than a failing task when it is off.
 DEFAULT_HISTORICAL_TYPES: tuple[str, ...] = ("historical_recon", "gau")
+#: Phase 25: bounded JavaScript content analysis. ``js_analysis`` is the documented
+#: stage name the AI layer reports (``ai.run_context.TASK_TYPE_COVERS_STAGE``) and the
+#: canonical task type. Registered **only** when ``config.javascript.enabled`` is true --
+#: fail-closed and disabled by default -- so a disabled gate leaves the stage
+#: uncovered-without-capability rather than enqueuing a task the server would refuse.
+DEFAULT_JS_ANALYSIS_TYPES: tuple[str, ...] = ("js_analysis",)
 
 
 class ServeConfigurationError(RuntimeError):
@@ -387,6 +394,21 @@ def _default_adapters(
     if config is not None and config.web.historical_urls:
         adapters.update(
             {kind: GauAdapter for kind in DEFAULT_HISTORICAL_TYPES}
+        )
+    # Phase 25: bounded JavaScript content analysis. Registered only behind the explicit
+    # ``javascript.enabled`` opt-in, so a disabled gate leaves no js_analysis-capable type
+    # in the registry (the coverage loop then reports the stage as uncovered-without-
+    # capability instead of enqueuing a task that would be refused). One shared
+    # ``JsFetchBudget`` is created here and captured by every js_analysis adapter instance,
+    # so the whole run carries a single total-bytes ceiling; the orchestrator executes
+    # tasks sequentially, so the counter needs no lock.
+    if config is not None and config.javascript.enabled:
+        js_budget = JsFetchBudget()
+        adapters.update(
+            {
+                kind: (lambda: JsAnalyzeAdapter(budget=js_budget))
+                for kind in DEFAULT_JS_ANALYSIS_TYPES
+            }
         )
     return adapters
 

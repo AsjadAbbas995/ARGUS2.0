@@ -32,6 +32,7 @@ web:
   historical_urls: true
 
 javascript:
+  enabled: false               # Phase 25: register the js_analysis adapter (default off)
   deep_analysis: true
   source_maps: true
 
@@ -72,6 +73,7 @@ outputs:
 | `recon` | `aggressive_subdomain_discovery` | Enables broader (slower) subdomain enumeration sources |
 | `network.tcp_ports` | `start` / `end` | Authorized TCP port scan range (default `1–1000`) |
 | `web` | `http_probe` / `crawling` / `content_discovery` / `historical_urls` | Toggle each web-recon stage independently |
+| `javascript` | `enabled` | Register the in-process `js_analysis` adapter. Default `false` (fail-closed): with no adapter, `js_analysis` is absent from `available_types`, no expansion task is proposed, and coverage reports it via `uncovered_without_capability`. Read only at adapter-registration time. |
 | `javascript` | `deep_analysis` / `source_maps` | Toggle JS extraction and source-map analysis |
 | `api` | `rest` / `openapi` / `swagger` / `graphql` / `websocket` / `authentication_analysis` | Toggle each API-recon capability independently |
 | `ai` | `mode` | Force `local`, force `cloud`, or let the router choose (`hybrid`) |

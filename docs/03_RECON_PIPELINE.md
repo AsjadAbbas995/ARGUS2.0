@@ -194,20 +194,26 @@ fresh liveness check (`17` in the source brief).
 
 ## 14. JavaScript Analysis
 
-**Purpose:** Extract endpoints, routes, parameters, domains, WebSocket URLs, API versions,
-object identifiers, and token-like strings from JavaScript.
-**Inputs:** JavaScript files discovered via crawling. **Tools:** Internal JS parser
-(`intelligence/javascript.py`). **Execution conditions:** Runs after Web Crawling discovers JS
-files. **Expected outputs:** Structured extraction results per file.
-**Normalized data:** `endpoints`, `parameters`, `apis`, `websocket_endpoints` derived from JS.
-**DB entities:** `javascript_files`, `endpoints`, `parameters`, `apis`, `websocket_endpoints`.
-**Evidence generated:** Parsed-JS evidence linked to the source file. **Possible discoveries:**
-Hidden/internal APIs, auth-related code, feature flags, token-like strings.
+**Purpose:** Extract endpoints, routes, and parameters from JavaScript discovered by crawling.
+**Inputs:** JavaScript file URLs discovered via crawling. **Tools:** In-process `js_analysis`
+adapter plus an internal bounded HTTPS fetcher and offline parser
+(`recon/web/js_analyze.py`, `intelligence/javascript.py`). **Execution conditions:** Runs after
+Web Crawling discovers JS files, and only when `javascript.enabled` registers the adapter
+(fail-closed, default off). **Expected outputs:** Structured extraction results per file.
+**Normalized data:** `urls`, `endpoints`, `parameters` derived from JS.
+**DB entities:** `urls`, `endpoints`, `parameters`; the JS file URL itself is recorded in
+`javascript_files` by Web Crawling. **Evidence generated:** Parsed-JS observations linked to the
+source file. **Possible discoveries:** Hidden/internal APIs, auth-related code, feature flags.
 **Follow-up tasks:** API discovery/authorization analysis for newly found endpoints; source map
-analysis if maps are exposed. **Dependencies:** Web Crawling. **Safety considerations:** A
-token-like string is classified and investigated, never automatically reported as a confirmed
-secret (`18` in the source brief). **Failure conditions:** Obfuscated/minified JS that cannot be
-parsed is recorded as `UNKNOWN`, not guessed at.
+analysis if maps are exposed. **Dependencies:** Web Crawling. **Safety considerations:** The
+fetcher is the SSRF boundary: it resolves the target, rejects non-public/prohibited IPs, pins the
+connection to the validated address, refuses redirects, and enforces a per-run byte budget.
+Extracted observations are new surface only; the adapter never emits `JavascriptFileObservation`,
+so JS analysis cannot recurse into itself. A token-like string is classified and investigated,
+never automatically reported as a confirmed secret (`18` in the source brief).
+**Failure conditions:** A skipped or failed fetch and obfuscated/minified JS that cannot be
+parsed are recorded as an observation only, never guessed at; every skip/error is non-fatal and
+persists no graph row.
 
 ## 15. Source Maps
 

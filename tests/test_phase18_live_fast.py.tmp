@@ -1,0 +1,113 @@
+"""Phase 18: AI coverage gaps - fast live PostgreSQL tests (5433 fixture)."""
+
+from __future__ import annotations
+
+import os
+import uuid
+
+import pytest
+
+from database.repositories.all import Repositories
+from database.repositories.base import DatabaseConnection
+from api import server
+from fastapi.testclient import TestClient
+from reports import json_report, markdown_report, html_report
+
+pytestmark = pytest.mark.skipif(
+    not os.environ.get("ARGUS_TEST_DATABASE_URL"),
+    reason="set ARGUS_TEST_DATABASE_URL=postgresql://argus@127.0.0.1:5433/argus_test to run live tests",
+)
+
+def _url() -> str:
+    return os.environ["ARGUS_TEST_DATABASE_URL"]
+
+def _make_test_run_with_conn(conn):
+    import psycopg
+    from psycopg.rows import dict_row
+    r = Repositories(conn)
+    pid = uuid.uuid4()
+    from database.models.entities import Run
+    run = Run(program_id=pid, status="completed")
+    res = r.runs.insert(run)
+    return (r, res["id"] if isinstance(res, dict) else getattr(res, "id", res.get("id")) if hasattr(res, "get") else res[0] if isinstance(res, tuple) else res)
+
+def test_live_schema_exists():
+    from psycopg.rows import dict_row
+    import psycopg
+    conn = psycopg.connect(_url(), row_factory=dict_row, autocommit=True)
+    try:
+        cur = conn.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name='ai_coverage_gaps'")
+        r = cur.fetchone(); assert (r["count"] if "count" in r else r.get("c") or r[0]) == 1
+        cur = conn.execute("SELECT column_name FROM information_schema.columns WHERE table_name='ai_coverage_gaps' ORDER BY ordinal_position")
+        cols = [row["column_name"] if "column_name" in row else row[0] for row in cur.fetchall()]
+    finally:
+        conn.close()
+    assert {"run_id", "stage", "observation_count", "first_seen", "last_seen"}.issubset(set(cols))
+
+def test_live_persistence_and_upsert():
+    import psycopg
+    from psycopg.rows import dict_row
+    conn = psycopg.connect(_url(), row_factory=dict_row, autocommit=True)
+    try:
+        r = Repositories(conn)
+    except Exception:
+        raise
+    run_id = _make_test_run(r)
+    stage = "analysis"
+    r.ai_coverage_gaps.observe(run_id=run_id, stage=stage, key="k1")
+    gaps = r.ai_coverage_gaps.list_for_run(run_id)
+    assert len(gaps) == 1
+    oc1 = gaps[0]["observation_count"]
+    r.ai_coverage_gaps.observe(run_id=run_id, stage=stage, key="k2")
+    gaps = r.ai_coverage_gaps.list_for_run(run_id)
+    assert len(gaps) == 1
+    oc2 = gaps[0]["observation_count"]
+    assert oc2 >= oc1 + 1
+
+def test_live_run_isolation():
+    import psycopg
+    from psycopg.rows import dict_row
+    conn = psycopg.connect(_url(), row_factory=dict_row, autocommit=True)
+    try:
+        _, run_a = _make_test_run(conn)
+        _, run_b = _make_test_run(Repositories(conn).conn if False else conn)  # simpler
+    finally:
+        pass
+    stage = "analysis"
+    r.ai_coverage_gaps.observe(run_id=run_a, stage=stage, key="k")
+    r.ai_coverage_gaps.observe(run_id=run_b, stage=stage, key="k")
+    gaps_a = r.ai_coverage_gaps.list_for_run(run_a)
+    gaps_b = r.ai_coverage_gaps.list_for_run(run_b)
+    assert len(gaps_a) == 1 and len(gaps_b) == 1
+    assert gaps_a[0]["run_id"] == str(run_a)
+    assert gaps_b[0]["run_id"] == str(run_b)
+
+def test_live_gaps_do_not_create_tasks_or_hypotheses():
+    r = Repositories(_url())
+    run_id = _make_test_run(r)
+    before_tasks = r.tasks.count() if hasattr(r.tasks, "count") else 0
+    before_hyps = r.hypotheses.count() if hasattr(r.hypotheses, "count") else 0
+    r.ai_coverage_gaps.observe(run_id=run_id, stage="analysis", key="gap")
+    after_tasks = r.tasks.count() if hasattr(r.tasks, "count") else 0
+    after_hyps = r.hypotheses.count() if hasattr(r.hypotheses, "count") else 0
+    assert after_tasks == before_tasks
+    assert after_hyps == before_hyps
+
+def test_live_api_reports_read_path():
+    r = Repositories(_url())
+    run_id = _make_test_run(r)
+    stage = "analysis"
+    r.ai_coverage_gaps.observe(run_id=run_id, stage=stage, key="coverage_gap")
+    client = TestClient(server.app)
+    resp = client.get(f"/api/v1/runs/{run_id}/ai-coverage-gaps")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["run_id"] == str(run_id)
+    assert isinstance(body["gaps"], list) and len(body["gaps"]) >= 1
+    report = {"run_id": str(run_id), "ai_coverage_gaps": body["gaps"]}
+    j = json_report.render(report)
+    assert "ai_coverage_gaps" in j
+    m = markdown_report.render(report)
+    assert "coverage" in m.lower() or "gap" in m.lower()
+    h = html_report.render(report)
+    assert "coverage" in h.lower() or "gap" in h.lower()
