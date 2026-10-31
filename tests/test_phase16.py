@@ -200,6 +200,36 @@ class TestCoverageGaps:
     def test_an_aliased_task_type_covers_the_same_stage(self):
         assert "dns_resolve" not in run_context.coverage_gaps([_task("resolve")], self.EXEC)
 
+    def test_registered_alias_task_types_map_to_their_stages(self):
+        assert run_context.TASK_TYPE_COVERS_STAGE["subdomain_enum"] == "subdomain_enum"
+        assert run_context.TASK_TYPE_COVERS_STAGE["httpx"] == "http_probe"
+        assert run_context.TASK_TYPE_COVERS_STAGE["web_probe"] == "http_probe"
+        assert run_context.TASK_TYPE_COVERS_STAGE["nmap"] == "port_scan"
+
+    @pytest.mark.parametrize(
+        ("task_type", "stage", "executable"),
+        (
+            ("subdomain_enum", "subdomain_enum", ("subfinder", "subdomain_enum")),
+            ("httpx", "http_probe", ("http_probe", "httpx", "web_probe")),
+            ("web_probe", "http_probe", ("http_probe", "httpx", "web_probe")),
+            ("nmap", "port_scan", ("port_scan", "nmap")),
+        ),
+    )
+    def test_a_registered_alias_covers_its_stage(self, task_type, stage, executable):
+        assert stage in run_context.coverage_gaps([], executable)
+        assert stage not in run_context.coverage_gaps([_task(task_type)], executable)
+
+    def test_canonical_task_types_still_cover_their_stages(self):
+        cases = (
+            ("subfinder", "subdomain_enum", ("subfinder", "subdomain_enum")),
+            ("http_probe", "http_probe", ("http_probe", "httpx", "web_probe")),
+            ("port_scan", "port_scan", ("port_scan", "nmap")),
+        )
+        for task_type, stage, executable in cases:
+            assert stage not in run_context.coverage_gaps(
+                [_task(task_type)], executable
+            )
+
     def test_a_failed_task_covers_nothing(self):
         assert "dns_resolve" in run_context.coverage_gaps(
             [_task("dns_resolve", status="failed")], self.EXEC

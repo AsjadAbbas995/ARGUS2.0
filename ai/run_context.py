@@ -67,12 +67,16 @@ from .recon_agent import (
 #: extra loop pass while under-reporting one silently skips coverage.
 TASK_TYPE_COVERS_STAGE: Mapping[str, str] = {
     "subfinder": "subdomain_enum",
+    "subdomain_enum": "subdomain_enum",
     "dns_resolve": "dns_resolve",
     "dns": "dns_resolve",
     "resolve": "dns_resolve",
     "http_probe": "http_probe",
+    "httpx": "http_probe",
+    "web_probe": "http_probe",
     "httpx_probe": "http_probe",
     "port_scan": "port_scan",
+    "nmap": "port_scan",
     "naabu": "port_scan",
     "tech_detect": "tech_detect",
     "whatweb": "tech_detect",
