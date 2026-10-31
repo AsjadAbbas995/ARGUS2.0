@@ -88,9 +88,14 @@ from uuid import UUID
 from database.models.entities import AiAnalysis, Hypothesis, Task
 
 from . import hypothesis_agent, recon_agent
-from .recon_agent import STAGE_PRIORITY
+from .recon_agent import AI_SCHEDULABLE_STAGES, STAGE_PRIORITY
 from .router import RouteConfig
-from .run_context import hypothesis_context, recon_context, uncovered_without_capability
+from .run_context import (
+    expansion_owned_gaps,
+    hypothesis_context,
+    recon_context,
+    uncovered_without_capability,
+)
 from .validator import validate_structured_output
 
 log = logging.getLogger(__name__)
@@ -151,24 +156,23 @@ _PRIORITIES = frozenset({"low", "medium", "high"})
 #: recorded in ``ai_analysis`` -- the audit trail is unconditional -- but creates no hypothesis.
 _HYPOTHESIS_TYPES = frozenset({"hypothesis", "unverified_claim"})
 
-#: Documented recon stage -> the task type that executes it. The served adapter registry is keyed
-#: by task type, and stage names and task types are not the same vocabulary, so the translation
-#: is stated here rather than assumed.
+#: AI-schedulable recon stage -> the task type that executes it. The served adapter registry is
+#: keyed by task type, and stage names and task types are not the same vocabulary, so the
+#: translation is stated here rather than assumed.
+#:
+#: Expansion-owned stages are deliberately absent. ``web_crawl``, ``content_discover`` and
+#: ``js_analysis`` need an evidence-backed URL seed from a completed parent task, while the AI
+#: planner only proposes the scope-root hostname. Deterministic discovery expansion schedules
+#: them instead.
 TASK_TYPE_FOR_STAGE: Mapping[str, str] = {
     "subdomain_enum": "subfinder",
     "dns_resolve": "dns_resolve",
     "port_scan": "port_scan",
     "http_probe": "http_probe",
     "tech_detect": "tech_detect",
-    # Phase 23: approved-wordlist content discovery. The canonical task type
-    # registered in the served adapter registry, dispatched by the loop's planner.
-    "content_discover": "content_discover",
     # Phase 24: passive historical URL discovery. The canonical task type registered in
     # the served adapter registry (gated on ``web.historical_urls``).
     "historical_recon": "historical_recon",
-    # Phase 25: JavaScript analysis. The canonical task type registered in the
-    # served adapter registry (gated on ``javascript.enabled``).
-    "js_analysis": "js_analysis",
 }
 
 #: ``input_context_ref`` prefix. The ``ai_analysis`` table has no ``run_id`` column, so run
@@ -204,6 +208,7 @@ class AnalysisResult:
     outcomes: tuple[AgentOutcome, ...] = field(default_factory=tuple)
     tasks: tuple[Task, ...] = field(default_factory=tuple)
     uncovered_without_capability: tuple[str, ...] = field(default_factory=tuple)
+    expansion_owned_gaps: tuple[str, ...] = field(default_factory=tuple)
     status: str = ANALYSIS_NO_PROPOSALS
     error: Optional[str] = None
 
@@ -331,11 +336,13 @@ class AnalysisHook:
             # persisted rows and the value reported on ``last_result`` cannot disagree.
             gaps = uncovered_without_capability(tasks, sorted(self.runnable))
             coverage_ok = self._record_coverage_gaps(run_id, gaps)
+            expansion_owned = expansion_owned_gaps(tasks)
 
             self.last_result = AnalysisResult(
                 outcomes=tuple(o for o in outcomes if o.proposal is not None or o.error),
                 tasks=tuple(proposed),
                 uncovered_without_capability=gaps,
+                expansion_owned_gaps=expansion_owned,
                 # "ran and proposed" is measured by what was actually persisted, not by
                 # whether an agent returned something: a proposal that failed validation or
                 # could not be persisted proposed no new work.
@@ -449,8 +456,9 @@ class AnalysisHook:
         ``ai.recon_agent`` does not carry the stage as a proposal field: it writes the scope
         root to ``target`` and names the stage only inside ``observation``. Rather than parse it
         out of prose, the stage is recomputed from the same ordered ``gaps`` tuple the agent was
-        given -- ``recon_agent`` proposes the first gap in ``STAGE_PRIORITY`` order -- and then
-        *confirmed* against the observation text. If the two disagree the proposal is refused.
+        given -- the AI-schedulable gaps from :func:`recon_context`, in ``STAGE_PRIORITY``
+        order -- and then *confirmed* against the observation text. If the two disagree the
+        proposal is refused.
 
         That yields two independent refusals rather than one guess: the capability gate rejects
         a stage with no registered adapter, and the confirmation rejects a proposal whose stage
@@ -461,6 +469,8 @@ class AnalysisHook:
         if not gaps:
             return None
         stage = str(gaps[0])
+        if stage not in AI_SCHEDULABLE_STAGES:
+            return None
         if stage not in str(proposal.get("observation", "")):
             return None
         task_type = TASK_TYPE_FOR_STAGE.get(stage)

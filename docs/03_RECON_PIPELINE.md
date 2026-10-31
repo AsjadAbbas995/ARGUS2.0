@@ -6,6 +6,16 @@ stage below follows the same template: **Purpose, Inputs, Tools, Execution Condi
 Outputs, Normalized Data, Database Entities, Evidence Generated, Possible Discoveries, Follow-Up
 Tasks, Dependencies, Safety Considerations, Failure Conditions.**
 
+## Scheduling Ownership
+
+The AI planner (ReconAgent) may schedule only stages whose adapters accept the scope-root
+hostname target it proposes: `subdomain_enum`, `dns_resolve`, `port_scan`, `http_probe`,
+`tech_detect`, and `historical_recon`. Web crawling, content discovery, and JavaScript analysis
+are expansion-owned: their adapters require an evidence-backed URL seed, so deterministic
+discovery expansion schedules them only after a completed task yields that seed. All remaining
+stages have no registered adapter and stay visible as reported coverage gaps, never as
+AI-proposed tasks.
+
 ---
 
 ## 1. Recon Philosophy

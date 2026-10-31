@@ -18,15 +18,21 @@ This module therefore never invents a fact, never widens a claim, and never read
 run did not observe. A run with no facts yields empty context, which the agents correctly
 treat as "no proposal".
 
-Coverage gaps are intersected with capability
---------------------------------------------
-``recon_agent.STAGE_PRIORITY`` names 18 documented recon stages. Only some have a registered
+Coverage gaps are intersected with capability and ownership
+----------------------------------------------------------
+``recon_agent.STAGE_PRIORITY`` names 19 documented recon stages. Only some have a registered
 adapter, and ``api/serve.py`` refuses a task type with no adapter *before* constructing one, so
 proposing an unexecutable stage would not merely waste a pass -- it would enqueue a task that
 fails immediately.
 
-So :func:`coverage_gaps` returns only stages that are **both uncovered and executable**, and
-reports the unexecutable remainder separately as :func:`uncovered_without_capability`. The
+:func:`coverage_gaps` keeps the full uncovered-and-executable view. :func:`ai_schedulable_gaps`
+then narrows it to stages the ReconAgent may actually schedule. Expansion-owned stages
+(``web_crawl``, ``content_discover``, ``js_analysis``) are deliberately excluded from the agent
+context: their adapters need an evidence-backed URL seed, while the agent only has the
+scope-root hostname. They remain visible through :func:`expansion_owned_gaps` and are scheduled
+by deterministic discovery expansion instead.
+
+:func:`uncovered_without_capability` still reports the unexecutable remainder separately. The
 agent therefore proposes real, runnable next work, and the gaps it cannot act on stay visible
 as an honest record instead of becoming doomed tasks. This is the same "name the gap rather
 than fill it" discipline Phase 15 applied to unproduced record kinds.
@@ -49,7 +55,11 @@ from .context import (
     ReconContext,
     ScopeRef,
 )
-from .recon_agent import STAGE_PRIORITY
+from .recon_agent import (
+    AI_SCHEDULABLE_STAGES,
+    EXPANSION_OWNED_STAGES,
+    STAGE_PRIORITY,
+)
 
 #: Task type -> the documented recon stage it satisfies. Deliberately narrow: a stage counts as
 #: covered only when a task of *exactly* that type has run. Anything else is treated as a gap.
@@ -209,6 +219,34 @@ def coverage_gaps(tasks: Iterable[Any], executable: Iterable[str]) -> tuple[str,
     return tuple(s for s in STAGE_PRIORITY if s not in done and s in runnable)
 
 
+def ai_schedulable_gaps(
+    tasks: Iterable[Any], executable: Iterable[str]
+) -> tuple[str, ...]:
+    """Uncovered, executable stages the ReconAgent is allowed to schedule."""
+    return tuple(
+        stage
+        for stage in coverage_gaps(tasks, executable)
+        if stage in AI_SCHEDULABLE_STAGES
+    )
+
+
+def expansion_owned_gaps(tasks: Iterable[Any]) -> tuple[str, ...]:
+    """Uncovered stages owned by deterministic discovery expansion.
+
+    Reported independently of adapter registration so ownership is never lost from the AI
+    pass. When an expansion adapter's gate is off, :func:`uncovered_without_capability` also
+    names the stage; that is a capability fact, not a change of owner. These stages are never
+    proposed by :mod:`ai.recon_agent`: expansion schedules them only after a completed task
+    yields the URL seed their adapters require.
+    """
+    done = covered_stages(tasks)
+    return tuple(
+        stage
+        for stage in STAGE_PRIORITY
+        if stage in EXPANSION_OWNED_STAGES and stage not in done
+    )
+
+
 def uncovered_without_capability(
     tasks: Iterable[Any], executable: Iterable[str]
 ) -> tuple[str, ...]:
@@ -242,7 +280,7 @@ def recon_context(
         existing_tasks=tuple(
             str(getattr(t, "target", "") or "") for t in tasks if getattr(t, "target", "")
         ),
-        gaps=coverage_gaps(tasks, executable),
+        gaps=ai_schedulable_gaps(tasks, executable),
     )
 
 

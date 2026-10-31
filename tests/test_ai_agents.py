@@ -59,10 +59,10 @@ def _recon_gap() -> context.ReconContext:
                 "no JS files recorded for app.example.com", "obs-0001", "js_analysis"
             ),
             context.ObservationRecord(
-                "GraphQL introspection unresolved", "obs-0002", "graphql_recon"
+                "historical URLs unresolved for app.example.com", "obs-0002", "historical_recon"
             ),
         ),
-        gaps=("graphql_recon", "js_analysis"),
+        gaps=("js_analysis", "historical_recon"),
     )
 
 
@@ -77,6 +77,19 @@ def _recon_all_covered() -> context.ReconContext:
 
 def _recon_no_evidence() -> context.ReconContext:
     return context.ReconContext(scope=_scope(), assets=(), observations=(), gaps=("subdomain_enum",))
+
+
+def _recon_expansion_only() -> context.ReconContext:
+    return context.ReconContext(
+        scope=_scope(),
+        assets=(context.AssetRecord("app.example.com", "asset-0001"),),
+        observations=(
+            context.ObservationRecord(
+                "no JS files recorded for app.example.com", "obs-0001", "js_analysis"
+            ),
+        ),
+        gaps=("web_crawl", "content_discover", "js_analysis"),
+    )
 
 
 def _api(documented: bool) -> context.ApiContext:
@@ -222,7 +235,7 @@ def _hypothesis_empty() -> context.HypothesisContext:
 # --- positive contract cases ------------------------------------------------------
 
 _POSITIVE_CASES = (
-    pytest.param(recon_agent.run, _recon_gap, {"obs-0001"}, id="recon-gap"),
+    pytest.param(recon_agent.run, _recon_gap, {"obs-0002"}, id="recon-gap"),
     pytest.param(api_agent.run, lambda: _api(True), {"ep-0001", "prm-0001", "api-0001"}, id="api-documented"),
     pytest.param(api_agent.run, lambda: _api(False), {"ep-0001", "prm-0001", "api-0001"}, id="api-undocumented"),
     pytest.param(js_agent.run, lambda: _js(_J_ENDPOINT), {"js-0002"}, id="js-endpoint"),
@@ -266,12 +279,13 @@ def test_agent_output_is_byte_deterministic(agent_run, ctx_factory, allowed_sour
 
 # --- per-agent documented behavior --------------------------------------------------
 
-def test_recon_proposes_highest_priority_uncovered_stage():
+def test_recon_proposes_highest_priority_ai_schedulable_stage():
     out = recon_agent.run(_recon_gap())
     assert out["type"] == "task"
     assert out["truth_label"] == "INFERENCE"
     assert out["target"] == "example.com"
-    assert "js_analysis" in out["observation"]
+    assert "historical_recon" in out["observation"]
+    assert "js_analysis" not in out["observation"]
 
 
 def test_api_flagged_undocumented_schema_no_fabrication():
@@ -334,6 +348,7 @@ def test_triage_relays_validated_finding_without_revalidating():
 _NO_OUTPUT_CASES = (
     pytest.param(recon_agent.run, _recon_all_covered, id="recon-all-covered"),
     pytest.param(recon_agent.run, _recon_no_evidence, id="recon-no-evidence"),
+    pytest.param(recon_agent.run, _recon_expansion_only, id="recon-expansion-only"),
     pytest.param(api_agent.run, _api_empty, id="api-no-endpoints"),
     pytest.param(js_agent.run, lambda: _js(), id="js-no-extractions"),
     pytest.param(authz_agent.run, _authz_not_parameterized, id="authz-no-object-id"),

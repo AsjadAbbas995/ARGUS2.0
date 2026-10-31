@@ -254,6 +254,64 @@ class TestCoverageGaps:
         gaps = run_context.coverage_gaps([], self.EXEC)
         assert list(gaps) == [s for s in STAGE_PRIORITY if s in set(self.EXEC)]
 
+    def test_stage_ownership_is_an_exact_partition(self):
+        from ai.recon_agent import (
+            AI_SCHEDULABLE_STAGES,
+            EXPANSION_OWNED_STAGES,
+            NO_CAPABILITY_STAGES,
+            STAGE_OWNERSHIP,
+            STAGE_PRIORITY,
+        )
+
+        categories = (AI_SCHEDULABLE_STAGES, EXPANSION_OWNED_STAGES, NO_CAPABILITY_STAGES)
+        assert all(a.isdisjoint(b) for a in categories for b in categories if a is not b)
+        assert set().union(*categories) == set(STAGE_PRIORITY)
+        assert set(STAGE_OWNERSHIP) == set(STAGE_PRIORITY)
+        assert all(
+            STAGE_OWNERSHIP[stage]
+            == (
+                "ai_schedulable"
+                if stage in AI_SCHEDULABLE_STAGES
+                else "expansion_owned"
+                if stage in EXPANSION_OWNED_STAGES
+                else "no_capability"
+            )
+            for stage in STAGE_PRIORITY
+        )
+
+    def test_ai_task_mapping_matches_ai_schedulable_stages(self):
+        from ai.recon_agent import AI_SCHEDULABLE_STAGES, EXPANSION_OWNED_STAGES
+
+        assert set(ai_loop.TASK_TYPE_FOR_STAGE) == set(AI_SCHEDULABLE_STAGES)
+        assert EXPANSION_OWNED_STAGES.isdisjoint(ai_loop.TASK_TYPE_FOR_STAGE)
+
+    def test_recon_context_exposes_only_ai_schedulable_gaps(self):
+        executable = (
+            "dns_resolve",
+            "web_crawl",
+            "katana",
+            "content_discover",
+            "ffuf",
+            "js_analysis",
+        )
+        ctx = run_context.recon_context(
+            _chain(), {"scope": {"allowed_domains": [TARGET]}}, [], executable
+        )
+        assert ctx.gaps == ("dns_resolve",)
+        assert "web_crawl" in run_context.coverage_gaps([], executable)
+
+    def test_expansion_owned_gaps_are_reported_separately(self):
+        assert run_context.expansion_owned_gaps([]) == (
+            "web_crawl",
+            "content_discover",
+            "js_analysis",
+        )
+
+    def test_disabled_expansion_stage_keeps_its_owner_and_capability_fact(self):
+        executable = ("web_crawl", "katana", "content_discover", "ffuf")
+        assert "js_analysis" in run_context.expansion_owned_gaps([])
+        assert "js_analysis" in run_context.uncovered_without_capability([], executable)
+
 
 # -- the hook -----------------------------------------------------------------
 
@@ -355,6 +413,21 @@ class TestAnalysisHook:
         hook = self._hook(store)
         hook(_run(), [])
         assert "web_crawl" in hook.last_result.uncovered_without_capability
+
+    def test_expansion_owned_gaps_are_reported_but_never_proposed(self):
+        store = FakeStorage()
+        hook = build_analysis_hook(
+            store,
+            ("web_crawl", "katana", "content_discover", "ffuf", "js_analysis"),
+        )
+        tasks = hook(_run(), [])
+        assert tasks == []
+        assert hook.last_result.expansion_owned_gaps == (
+            "web_crawl",
+            "content_discover",
+            "js_analysis",
+        )
+        assert "web_crawl" not in hook.last_result.uncovered_without_capability
 
 
 class TestFailClosed:
@@ -513,10 +586,9 @@ class TestServedComposition:
 
     def test_the_gate_excludes_every_stage_without_an_adapter(self):
         orch = _served_orchestrator(True)
-        # Phase 20A registered Subfinder and Nmap adapters; Phase 21A registered
-        # the served ``tech_detect`` and Phase 23 ``content_discover`` adapters, so
-        # every stage with a served adapter is translatable into a runnable task
-        # type. Only stages that still lack an adapter must not be runnable.
+        # Phase 29 keeps this mapping to AI-schedulable stages only. The served default
+        # registers every one except ``historical_recon`` (gated on ``web.historical_urls``),
+        # so that stage alone must remain non-runnable here.
         covered = frozenset(
             {
                 "dns_resolve",
@@ -524,7 +596,6 @@ class TestServedComposition:
                 "subdomain_enum",
                 "port_scan",
                 "tech_detect",
-                "content_discover",
             }
         )
         for stage, task_type in ai_loop.TASK_TYPE_FOR_STAGE.items():

@@ -4,6 +4,10 @@ Proposes the next in-scope reconnaissance *task* (Common Output ``type="task"``)
 caller-evidenced coverage gaps, in the documented recon-stage priority order. Emits no
 proposal when no gap remains or when no recorded observation supports one. Never proposes an
 out-of-scope target, never invents evidence, and never executes anything.
+
+Only :data:`AI_SCHEDULABLE_STAGES` may be proposed here. The expansion-owned stages require an
+evidence-backed URL seed, and this agent only knows the scope-root hostname; scheduling them
+from here would enqueue an adapter call with the wrong kind of target.
 """
 
 from __future__ import annotations
@@ -40,13 +44,46 @@ STAGE_PRIORITY = (
     "cdn_waf_intel",
 )
 
+#: Stages the AI planner may schedule directly. Their adapters accept the scope-root
+#: hostname target :func:`_propose_stage` supplies.
+AI_SCHEDULABLE_STAGES = frozenset(
+    {
+        "subdomain_enum",
+        "dns_resolve",
+        "port_scan",
+        "http_probe",
+        "tech_detect",
+        "historical_recon",
+    }
+)
+
+#: Stages scheduled only by deterministic discovery expansion. Their adapters require an
+#: evidence-backed URL seed, not the bare hostname the AI planner has.
+EXPANSION_OWNED_STAGES = frozenset({"web_crawl", "content_discover", "js_analysis"})
+
+#: Stages in :data:`STAGE_PRIORITY` that no current adapter can execute. Derived rather than
+#: listed so a newly added stage cannot silently disappear from the ownership partition.
+NO_CAPABILITY_STAGES = frozenset(STAGE_PRIORITY) - AI_SCHEDULABLE_STAGES - EXPANSION_OWNED_STAGES
+
+#: The single scheduling owner for every documented stage. Exactly one value per stage.
+STAGE_OWNERSHIP: dict[str, str] = {
+    stage: (
+        "ai_schedulable"
+        if stage in AI_SCHEDULABLE_STAGES
+        else "expansion_owned"
+        if stage in EXPANSION_OWNED_STAGES
+        else "no_capability"
+    )
+    for stage in STAGE_PRIORITY
+}
+
 
 def run(ctx: ReconContext, cfg: Optional[RouteConfig] = None) -> Optional[dict]:
-    """Return one schema-valid task proposal for the next uncovered stage, or ``None``."""
+    """Return one schema-valid task proposal for the next uncovered AI-schedulable stage."""
     route(ROUTE_TASK, complexity="medium", reasoning_depth="high", cfg=cfg)
 
     for stage in STAGE_PRIORITY:
-        if stage in ctx.gaps:
+        if stage in AI_SCHEDULABLE_STAGES and stage in ctx.gaps:
             return _propose_stage(ctx, stage)
     return None
 

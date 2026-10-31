@@ -824,11 +824,13 @@ def test_coverage_enabled_reports_a_gap_then_closes_it():
     assert "js_analysis" not in run_context.coverage_gaps([_Done()], known)
 
 
-def test_task_type_mappings_include_js_analysis():
+def test_task_type_mappings_keep_js_analysis_expansion_owned():
     from ai import run_context
     from ai import loop
+    from ai.recon_agent import EXPANSION_OWNED_STAGES
 
-    assert loop.TASK_TYPE_FOR_STAGE["js_analysis"] == "js_analysis"
+    assert "js_analysis" in EXPANSION_OWNED_STAGES
+    assert "js_analysis" not in loop.TASK_TYPE_FOR_STAGE
     assert run_context.TASK_TYPE_COVERS_STAGE["js_analysis"] == "js_analysis"
 
 
