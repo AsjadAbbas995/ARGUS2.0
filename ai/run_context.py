@@ -198,6 +198,26 @@ def assets(surface: Mapping[str, Any]) -> tuple[AssetRecord, ...]:
     return tuple(sorted(records, key=lambda a: (a.hostname, a.evidence_id)))
 
 
+def runnable_stages(executable: Iterable[str]) -> frozenset[str]:
+    """Documented recon stages that the registered task types can execute.
+
+    ``executable`` is the adapter registry's task-type vocabulary, not a list of stage names.
+    Translate each entry through :data:`TASK_TYPE_COVERS_STAGE` so a tool spelling such as
+    ``httpx`` or ``nmap`` counts as capability for its stage. Existing callers that pass a
+    stage name directly keep working; unknown task types are ignored rather than becoming a
+    capability.
+    """
+    stages: set[str] = set()
+    for entry in executable:
+        task_type = str(entry)
+        stage = TASK_TYPE_COVERS_STAGE.get(task_type)
+        if stage is None and task_type in STAGE_PRIORITY:
+            stage = task_type
+        if stage is not None:
+            stages.add(stage)
+    return frozenset(stages)
+
+
 def covered_stages(tasks: Iterable[Any]) -> frozenset[str]:
     """Documented recon stages that a completed task has actually satisfied."""
     covered: set[str] = set()
@@ -218,7 +238,7 @@ def coverage_gaps(tasks: Iterable[Any], executable: Iterable[str]) -> tuple[str,
     enqueuing one would fail at execution (``api/serve.py`` refuses a task type with no
     adapter before constructing it).
     """
-    runnable = {str(t) for t in executable}
+    runnable = runnable_stages(executable)
     done = covered_stages(tasks)
     return tuple(s for s in STAGE_PRIORITY if s not in done and s in runnable)
 
@@ -260,7 +280,7 @@ def uncovered_without_capability(
     web_crawl" and "we could not, there is no adapter for it" are different facts and a
     reader of the run should be able to tell them apart.
     """
-    runnable = {str(t) for t in executable}
+    runnable = runnable_stages(executable)
     done = covered_stages(tasks)
     return tuple(s for s in STAGE_PRIORITY if s not in done and s not in runnable)
 

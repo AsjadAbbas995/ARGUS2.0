@@ -82,7 +82,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from uuid import UUID
 
 from database.models.entities import AiAnalysis, Hypothesis, Task
@@ -91,6 +91,7 @@ from . import hypothesis_agent, recon_agent
 from .recon_agent import AI_SCHEDULABLE_STAGES, STAGE_PRIORITY
 from .router import RouteConfig
 from .run_context import (
+    TASK_TYPE_COVERS_STAGE,
     expansion_owned_gaps,
     hypothesis_context,
     recon_context,
@@ -465,6 +466,10 @@ class AnalysisHook:
         cannot be tied back to the gap list. ``api/serve.py`` raises ``NoAdapterError`` before
         constructing an adapter for an unknown type, so an ungated proposal would not degrade
         gracefully -- it would fail the task it just created.
+
+        The canonical task type is preferred when the registry can run it. Otherwise the first
+        runnable alias in sorted order is used, so a registry that exposes only a tool spelling
+        (``httpx``, ``nmap``, ``subfinder``, ...) can still execute the stage it covers.
         """
         if not gaps:
             return None
@@ -473,8 +478,19 @@ class AnalysisHook:
             return None
         if stage not in str(proposal.get("observation", "")):
             return None
-        task_type = TASK_TYPE_FOR_STAGE.get(stage)
-        if task_type is None or task_type not in self.runnable:
+        canonical = TASK_TYPE_FOR_STAGE.get(stage)
+        if canonical in self.runnable:
+            task_type = canonical
+        else:
+            task_type = next(
+                (
+                    candidate
+                    for candidate in sorted(self.runnable)
+                    if TASK_TYPE_COVERS_STAGE.get(candidate) == stage
+                ),
+                None,
+            )
+        if task_type is None:
             return None
         target = str(proposal.get("target", ""))
         if not target:

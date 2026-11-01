@@ -219,6 +219,49 @@ class TestCoverageGaps:
         assert stage in run_context.coverage_gaps([], executable)
         assert stage not in run_context.coverage_gaps([_task(task_type)], executable)
 
+    @pytest.mark.parametrize(
+        ("task_type", "stage"),
+        (
+            ("subfinder", "subdomain_enum"),
+            ("subdomain_enum", "subdomain_enum"),
+            ("httpx", "http_probe"),
+            ("web_probe", "http_probe"),
+            ("nmap", "port_scan"),
+            ("dns", "dns_resolve"),
+            ("resolve", "dns_resolve"),
+            ("whatweb", "tech_detect"),
+            ("katana", "web_crawl"),
+            ("ffuf", "content_discover"),
+            ("gau", "historical_recon"),
+        ),
+    )
+    def test_a_tool_spelling_only_registry_is_a_capability(self, task_type, stage):
+        assert run_context.runnable_stages((task_type,)) == frozenset({stage})
+        assert stage in run_context.coverage_gaps([], (task_type,))
+        assert stage not in run_context.uncovered_without_capability([], (task_type,))
+
+    @pytest.mark.parametrize(
+        ("task_type", "stage"),
+        (
+            ("subfinder", "subdomain_enum"),
+            ("subdomain_enum", "subdomain_enum"),
+            ("httpx", "http_probe"),
+            ("web_probe", "http_probe"),
+            ("nmap", "port_scan"),
+            ("dns", "dns_resolve"),
+            ("resolve", "dns_resolve"),
+            ("whatweb", "tech_detect"),
+        ),
+    )
+    def test_a_tool_spelling_only_registry_exposes_an_ai_schedulable_gap(
+        self, task_type, stage
+    ):
+        assert stage in run_context.ai_schedulable_gaps([], (task_type,))
+
+    def test_unknown_task_type_does_not_become_a_capability(self):
+        assert run_context.runnable_stages(("not-a-task",)) == frozenset()
+        assert run_context.coverage_gaps([], ("not-a-task",)) == ()
+
     def test_canonical_task_types_still_cover_their_stages(self):
         cases = (
             ("subfinder", "subdomain_enum", ("subfinder", "subdomain_enum")),
@@ -401,6 +444,40 @@ class TestAnalysisHook:
         tasks = self._hook(store)(_run(), [])
         assert [t.type for t in tasks] == ["dns_resolve"]
         assert all(t.type in self.EXEC for t in tasks)
+
+    def test_an_alias_only_registry_schedules_that_alias(self):
+        store = FakeStorage()
+        tasks = build_analysis_hook(store, ("httpx",))(_run(), [])
+        assert [t.type for t in tasks] == ["httpx"]
+        assert [t.target for t in tasks] == [TARGET]
+
+    def test_an_alias_that_is_also_the_stage_name_is_scheduled(self):
+        store = FakeStorage()
+        tasks = build_analysis_hook(store, ("subdomain_enum",))(_run(), [])
+        assert [t.type for t in tasks] == ["subdomain_enum"]
+
+    def test_the_canonical_task_type_is_preferred_when_both_are_runnable(self):
+        store = FakeStorage()
+        tasks = build_analysis_hook(store, ("http_probe", "httpx"))(_run(), [])
+        assert [t.type for t in tasks] == ["http_probe"]
+
+    def test_alias_selection_is_deterministic(self):
+        store = FakeStorage()
+        tasks = build_analysis_hook(store, ("web_probe", "httpx"))(_run(), [])
+        assert [t.type for t in tasks] == ["httpx"]
+
+    def test_an_expansion_alias_alone_is_never_scheduled(self):
+        store = FakeStorage()
+        tasks = build_analysis_hook(store, ("katana",))(_run(), [])
+        assert tasks == []
+
+    def test_no_runnable_task_type_for_the_stage_fails_closed(self):
+        hook = build_analysis_hook(FakeStorage(), ())
+        proposal = {
+            "observation": "recon stage `http_probe` is uncovered",
+            "target": TARGET,
+        }
+        assert hook._task_from(_run(), proposal, ("http_probe",)) is None
 
     def test_a_proposed_task_targets_the_run_scope_root(self):
         store = FakeStorage()
