@@ -20,6 +20,15 @@ from database.models.entities import AiAnalysis, Run, Task
 
 TARGET = "example.com"
 
+ALIAS_ONLY_TASK_CASES = (
+    ("subdomain_enum", "subfinder"),
+    ("dns_resolve", "dns"),
+    ("dns_resolve", "resolve"),
+    ("port_scan", "nmap"),
+    ("tech_detect", "whatweb"),
+    ("historical_recon", "gau"),
+)
+
 
 # -- fixtures -----------------------------------------------------------------
 
@@ -262,6 +271,29 @@ class TestCoverageGaps:
         assert run_context.runnable_stages(("not-a-task",)) == frozenset()
         assert run_context.coverage_gaps([], ("not-a-task",)) == ()
 
+    def test_an_unsupported_stage_name_does_not_become_a_capability(self):
+        assert run_context.runnable_stages(("certificate",)) == frozenset()
+        assert run_context.ai_schedulable_gaps([], ("certificate",)) == ()
+
+    def test_a_legacy_stage_name_is_reporting_only_and_never_scheduled(self):
+        from ai.recon_agent import STAGE_PRIORITY
+
+        stage = "api_discover"
+        assert stage in STAGE_PRIORITY
+        assert stage not in run_context.TASK_TYPE_COVERS_STAGE
+        assert stage not in ai_loop.TASK_TYPE_FOR_STAGE
+        assert run_context.runnable_stages((stage,)) == frozenset({stage})
+        assert stage in run_context.coverage_gaps([], (stage,))
+        assert stage not in run_context.uncovered_without_capability([], (stage,))
+        assert run_context.ai_schedulable_gaps([], (stage,)) == ()
+
+        hook = build_analysis_hook(FakeStorage(), (stage,))
+        proposal = {
+            "observation": f"recon stage `{stage}` is uncovered",
+            "target": TARGET,
+        }
+        assert hook._task_from(_run(), proposal, (stage,)) is None
+
     def test_canonical_task_types_still_cover_their_stages(self):
         cases = (
             ("subfinder", "subdomain_enum", ("subfinder", "subdomain_enum")),
@@ -358,6 +390,17 @@ class TestCoverageGaps:
         assert set(ai_loop.TASK_TYPE_FOR_STAGE) == set(AI_SCHEDULABLE_STAGES)
         assert EXPANSION_OWNED_STAGES.isdisjoint(ai_loop.TASK_TYPE_FOR_STAGE)
 
+    def test_every_ai_schedulable_stage_round_trips_through_its_task_type(self):
+        from ai.recon_agent import AI_SCHEDULABLE_STAGES
+
+        for stage in sorted(AI_SCHEDULABLE_STAGES):
+            task_type = ai_loop.TASK_TYPE_FOR_STAGE.get(stage)
+            assert task_type is not None, f"{stage} has no canonical task type"
+            covered_stage = run_context.TASK_TYPE_COVERS_STAGE.get(task_type)
+            assert covered_stage == stage, (
+                f"{task_type!r} covers {covered_stage!r}, not {stage!r}"
+            )
+
     def test_recon_context_exposes_only_ai_schedulable_gaps(self):
         executable = (
             "dns_resolve",
@@ -384,6 +427,22 @@ class TestCoverageGaps:
         executable = ("web_crawl", "katana", "content_discover", "ffuf")
         assert "js_analysis" in run_context.expansion_owned_gaps([])
         assert "js_analysis" in run_context.uncovered_without_capability([], executable)
+
+    @pytest.mark.parametrize(
+        "stage",
+        ("web_crawl", "content_discover", "js_analysis"),
+    )
+    def test_expansion_owned_stages_report_capability_without_ai_ownership(
+        self, stage
+    ):
+        from ai.recon_agent import EXPANSION_OWNED_STAGES
+
+        assert stage in EXPANSION_OWNED_STAGES
+        assert run_context.runnable_stages((stage,)) == frozenset({stage})
+        assert stage in run_context.coverage_gaps([], (stage,))
+        assert stage not in run_context.uncovered_without_capability([], (stage,))
+        assert stage not in run_context.ai_schedulable_gaps([], (stage,))
+        assert stage in run_context.expansion_owned_gaps([])
 
 
 # -- the hook -----------------------------------------------------------------
@@ -470,6 +529,65 @@ class TestAnalysisHook:
         store = FakeStorage()
         tasks = build_analysis_hook(store, ("katana",))(_run(), [])
         assert tasks == []
+
+    @pytest.mark.parametrize(("stage", "alias"), ALIAS_ONLY_TASK_CASES)
+    def test_an_alias_only_registry_selects_the_alias_for_its_stage(
+        self, stage, alias
+    ):
+        hook = build_analysis_hook(FakeStorage(), (alias,))
+        run = _run()
+        proposal = {
+            "observation": f"recon stage `{stage}` is uncovered",
+            "target": TARGET,
+        }
+        task = hook._task_from(run, proposal, (stage,))
+        assert task is not None
+        assert task.type == alias
+        assert run_context.TASK_TYPE_COVERS_STAGE[task.type] == stage
+        assert task.target == TARGET
+        assert task.run_id == run.id
+        assert task.status == "pending"
+
+    @pytest.mark.parametrize(("stage", "alias"), ALIAS_ONLY_TASK_CASES)
+    def test_alias_selection_still_requires_the_named_stage(self, stage, alias):
+        hook = build_analysis_hook(FakeStorage(), (alias,))
+        proposal = {
+            "observation": "recon stage `http_probe` is uncovered",
+            "target": TARGET,
+        }
+        assert hook._task_from(_run(), proposal, (stage,)) is None
+
+    def test_alias_selection_still_requires_a_target(self):
+        hook = build_analysis_hook(FakeStorage(), ("httpx",))
+        proposal = {
+            "observation": "recon stage `http_probe` is uncovered",
+            "target": "",
+        }
+        assert hook._task_from(_run(), proposal, ("http_probe",)) is None
+
+    @pytest.mark.parametrize(
+        ("stage", "task_type"),
+        (
+            ("web_crawl", "katana"),
+            ("content_discover", "ffuf"),
+            ("js_analysis", "js_analysis"),
+        ),
+    )
+    def test_expansion_owned_task_types_are_never_selected(self, stage, task_type):
+        hook = build_analysis_hook(FakeStorage(), (task_type,))
+        proposal = {
+            "observation": f"recon stage `{stage}` is uncovered",
+            "target": TARGET,
+        }
+        assert hook._task_from(_run(), proposal, (stage,)) is None
+
+    def test_a_runnable_alias_for_another_stage_is_rejected(self):
+        hook = build_analysis_hook(FakeStorage(), ("nmap",))
+        proposal = {
+            "observation": "recon stage `http_probe` is uncovered",
+            "target": TARGET,
+        }
+        assert hook._task_from(_run(), proposal, ("http_probe",)) is None
 
     def test_no_runnable_task_type_for_the_stage_fails_closed(self):
         hook = build_analysis_hook(FakeStorage(), ())
