@@ -252,6 +252,8 @@ class ServedExecution:
                 raw_output_ref=execution.raw_output_ref,
             ),
             artifacts=tuple(execution.artifacts),
+            timed_out=execution.timed_out,
+            error=execution.error,
         )
 
     def __call__(self, task, scope=None, config=None) -> ToolRun:

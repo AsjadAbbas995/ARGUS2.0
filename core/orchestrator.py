@@ -93,6 +93,20 @@ class ToolRunOutcome:
 
     tool_run: ToolRun
     artifacts: tuple = ()
+    timed_out: bool = False
+    error: Optional[str] = None
+
+
+def _execution_failed(outcome: Any) -> bool:
+    """Whether a seam outcome explicitly reports an execution failure.
+
+    Only :class:`ToolRunOutcome` can carry this metadata. A bare ``ToolRun`` keeps
+    the legacy contract, including the rule that a non-zero exit code alone is
+    recorded but does not fail the task.
+    """
+    return isinstance(outcome, ToolRunOutcome) and bool(
+        outcome.timed_out or outcome.error
+    )
 
 
 #: An ingestion callback supplied by the served wiring: it maps artifacts to
@@ -582,6 +596,7 @@ class Orchestrator:
                 executed = True
                 continue
             tool_run, artifacts = _split_outcome(outcome)
+            failed = _execution_failed(outcome)
             try:
                 # Phase 14: the ToolRun, the ingested evidence/graph facts and the
                 # task's terminal state are one atomic unit. A storage that
@@ -591,7 +606,9 @@ class Orchestrator:
                     self.storage.insert_tool_run(tool_run)
                     if self.ingest is not None:
                         self.ingest(task, tool_run, artifacts, run, scope)
-                    self.storage.set_task_status(task.id, "completed")
+                    self.storage.set_task_status(
+                        task.id, "failed" if failed else "completed"
+                    )
             except Exception as exc:  # noqa: BLE001 - ingestion must not wedge the run
                 # The transaction rolled back, so no ToolRun, no evidence and no
                 # partial graph were committed, and the task is still ``running``.
@@ -603,7 +620,8 @@ class Orchestrator:
                 self.storage.set_task_status(task.id, "failed")
                 executed = True
                 continue
-            done.add(task.id)
+            if not failed:
+                done.add(task.id)
             executed = True
         return executed
 
