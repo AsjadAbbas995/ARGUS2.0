@@ -104,7 +104,8 @@ In-scope target
 
 This policy applies uniformly to every discovery surface **before any active interaction**:
 
-- Redirects encountered while probing (httpx follow-redirects)
+- Redirects encountered while probing (when a controlled redirect workflow is implemented;
+  the HTTPX probe adapter currently does not follow redirects)
 - DNS-discovered targets (hostname resolves to a new IP)
 - JavaScript-discovered hosts
 - API-discovered hosts / API responses pointing to other services
@@ -115,6 +116,11 @@ This policy applies uniformly to every discovery surface **before any active int
 Scope is always evaluated **before** active interaction, never after it. The Scope Guard is the
 only entity that decides in/out-of-scope status; AI agents, parsers, and adapters cannot override
 it.
+
+Current implementation status: the HTTPX probe adapter does not follow redirects and does not
+contact redirect destinations. A 3xx response may be recorded as an observation. The policy above
+remains authoritative for any future controlled redirect-chain workflow; no such workflow is
+implemented.
 
 ## Rate Limiting
 

@@ -2,8 +2,8 @@
 
 HTTP(S) probing + technology fingerprinting against one resolved ``host[:port]``.
 
-- Command construction: ``httpx -json -tech-detect -title -status-code
-  [ -follow-redirects]`` (argument array, never a shell string).
+- Command construction: ``httpx -json -tech-detect -title -status-code``
+  (argument array, never a shell string).
 - Output format: JSON lines (newline-delimited objects, one per probed URL).
 - Parser: JSON-lines -> ``web_apps`` + ``asset_technologies`` observations.
 - Normalized objects: ``web_apps``, ``technologies``, ``asset_technologies``
@@ -11,9 +11,9 @@ HTTP(S) probing + technology fingerprinting against one resolved ``host[:port]``
 - Raw output: preserved by the Tool Runner under ``storage/raw/httpx/``.
 - Errors: per-host connection failure recorded, non-fatal. **Timeouts:**
   per-request, short. **Safety:** host must be in-scope before probing;
-  redirect destinations are re-checked against scope before being followed
-  (``04_SCOPE_SAFETY.md`` §HTTP Redirect Handling). **Tests:** fixture parse
-  tests, including redirect-chain fixtures (``13_TESTING_STRATEGY.md``).
+  redirect following is disabled. A 3xx response may be recorded as an
+  observation, but its destination is never contacted by this adapter.
+  **Tests:** fixture parse tests (``13_TESTING_STRATEGY.md``).
 """
 
 from __future__ import annotations
@@ -76,19 +76,10 @@ TITLE_FIELD = "title"
 SERVER_FIELD = "webserver"
 CONTENT_TYPE_FIELD = "content_type"
 TECH_FIELD = "tech"
-REDIRECT_FIELD = "location"
-TECH_FIELD = "tech"
-
-TECH_FIELD = "tech"
-REDIRECT_DEST_FIELD = "location"
-REDIRECT_STATUS = 302
-
-#: Track whether ``-follow-redirects`` is present on the constructed command.
-FOLLOW_REDIRECTS_FLAG = "-follow-redirects"
 
 
 def extract_host_from_value(value: str) -> str:
-    """Best-effort hostname from a URL/redirect value (scope-ready, lowercased)."""
+    """Best-effort hostname from a URL/host value (scope-ready, lowercased)."""
     if "://" not in value:
         value = "http://" + value
     from urllib.parse import urlparse
@@ -116,8 +107,6 @@ class HttpxProbeAdapter(ToolAdapter):
         if not host:
             raise ValueError(f"httpx: task.target must be a host[:port], got {target!r}")
         command = ["httpx", "-json", "-tech-detect", "-title", "-status-code"]
-        if _follow_redirects(config):
-            command.append(FOLLOW_REDIRECTS_FLAG)
         command.append(target)
         return command
 
@@ -192,7 +181,7 @@ class HttpxProbeAdapter(ToolAdapter):
         config: Any,
         scope: ScopeGuard,
     ) -> Any:
-        """Probe via the controlled Tool Runner (scope-checked redirects)."""
+        """Probe via the controlled Tool Runner without following redirects."""
         from core.tool_runner import ToolUnavailableError
         from recon.base import ToolExecution
 
@@ -216,9 +205,3 @@ class HttpxProbeAdapter(ToolAdapter):
             artifacts=artifacts,
             timed_out=result.timed_out,
         )
-
-
-def _follow_redirects(config: Any) -> bool:
-    """Whether redirect following is enabled in the current configuration."""
-    web = getattr(getattr(config, "recon", None), "web", None)
-    return bool(getattr(web, "follow_redirects", False))

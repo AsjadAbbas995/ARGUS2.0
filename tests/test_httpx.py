@@ -15,10 +15,9 @@ Covered cases per ``06_TOOL_CONTRACTS.md`` §httpx:
 - A trailing **malformed JSON line** in the probe stream is recorded as a
   logged, **non-fatal** parse skip (``13_TESTING_STRATEGY.md`` §Adapter
   Fixture Tests: malformed lines never abort the run).
-- Redirect destinations are re-checked against scope before being followed
-  (``04_SCOPE_SAFETY.md`` §HTTP Redirect Handling); the adapter keeps the
-  ``location`` field on the raw stream for the *normalizer*, and never
-  follows a redirect itself.
+- HTTPX redirect following is disabled: the adapter never emits
+  ``-follow-redirects``, a 3xx response is recorded as an observation, and
+  its destination is never contacted by the adapter.
 """
 
 from __future__ import annotations
@@ -29,6 +28,7 @@ from typing import Any, Optional
 
 import pytest
 
+from core.config import Config
 from core.scope_guard import ScopeGuard, ScopeRule, ScopeRuleType
 from core.tool_runner import CommandResult, ToolRunner, ToolUnavailableError
 from recon.base import ScopeViolation
@@ -118,6 +118,17 @@ def test_parse_probe_surfaces_titles_and_webservers(adapter: HttpxProbeAdapter) 
     assert "nginx" in servers
 
 
+def test_parse_302_remains_web_app(adapter: HttpxProbeAdapter) -> None:
+    out = adapter.parse(_result(_read("probe.ndjson")))
+    redirects = [
+        o
+        for o in out
+        if isinstance(o, WebAppObservation) and o.status_code == 302
+    ]
+    assert len(redirects) == 1
+    assert redirects[0].url == "https://admin.example.com"
+
+
 def test_parse_probe_surfaces_technologies(adapter: HttpxProbeAdapter) -> None:
     out = adapter.parse(_result(_read("probe.ndjson")))
     tech = {o.technology for o in out if isinstance(o, AssetTechnologyObservation)}
@@ -184,14 +195,66 @@ def test_build_command_marker(
     assert command[-1] == "app.example.com"  # normalized target, never a shell string
 
 
+def test_real_config_never_enables_redirect_following(
+    adapter: HttpxProbeAdapter,
+) -> None:
+    config = Config.from_dict({"database": {"url": "sqlite://"}})
+    command = adapter.build_command(_Task("app.example.com"), config)
+    assert "-follow-redirects" not in command
+
+
+def test_web_follow_redirects_cannot_enable_following(
+    adapter: HttpxProbeAdapter,
+) -> None:
+    config = Config.from_dict(
+        {
+            "database": {"url": "sqlite://"},
+            "web": {"follow_redirects": True},
+        }
+    )
+    command = adapter.build_command(_Task("app.example.com"), config)
+    assert "-follow-redirects" not in command
+
+
+def test_recon_web_follow_redirects_cannot_enable_following(
+    adapter: HttpxProbeAdapter,
+) -> None:
+    config = Config.from_dict(
+        {
+            "database": {"url": "sqlite://"},
+            "recon": {"web": {"follow_redirects": True}},
+        }
+    )
+    command = adapter.build_command(_Task("app.example.com"), config)
+    assert "-follow-redirects" not in command
+
+
+def test_duck_typed_config_cannot_inject_follow_redirects(
+    adapter: HttpxProbeAdapter,
+) -> None:
+    class _RedirectWeb:
+        follow_redirects = True
+
+    class _RedirectRecon:
+        web = _RedirectWeb()
+
+    class _DuckConfig:
+        recon = _RedirectRecon()
+
+    command = adapter.build_command(_Task("app.example.com"), _DuckConfig())
+    assert "-follow-redirects" not in command
+
+
 # -- execution through the controlled runner ----------------------------------
 
 
 class _FakeRunner:
     """Minimal ToolRunner-compatible double (fixture probing, no subprocess)."""
 
-    def __init__(self) -> None:
+    def __init__(self, stdout: Optional[str] = None) -> None:
         self.saved: list[tuple[str, str]] = []
+        self.commands: list[list[str]] = []
+        self._stdout = _read("probe.ndjson") if stdout is None else stdout
 
     def save_raw(
         self, tool: str, content: str, *, extension: str = "out", tag: str = "tool"
@@ -202,7 +265,8 @@ class _FakeRunner:
     def run_command(
         self, command: list[str], *, tool: str, timeout: int = 120
     ) -> CommandResult:
-        return _result(_read("probe.ndjson"))
+        self.commands.append(list(command))
+        return _result(self._stdout)
 
 
 def test_execute_in_scope_preserves_raw(
@@ -220,6 +284,30 @@ def test_execute_in_scope_preserves_raw(
     assert execution.exit_code == 0
     assert runner.saved  # raw probe stream preserved via controlled runner
     assert {tool for tool, _ in runner.saved} == {"httpx"}
+
+
+def test_redirect_destination_does_not_trigger_second_request(
+    scope: ScopeGuard, config: Any
+) -> None:
+    class _AvailableProbe(HttpxProbeAdapter):
+        def is_available(self) -> bool:
+            return True
+
+    redirect_record = (
+        '{"url": "http://app.example.com", "scheme": "http", '
+        '"host": "app.example.com", "port": 80, "status_code": 302, '
+        '"location": "https://outside.example.org/login"}'
+    )
+    runner = _FakeRunner(stdout=redirect_record)
+    execution = _AvailableProbe().execute(
+        _Task("app.example.com"), runner, config, scope
+    )
+
+    assert len(runner.commands) == 1
+    assert all("outside.example.org" not in arg for arg in runner.commands[0])
+    apps = [o for o in execution.artifacts if isinstance(o, WebAppObservation)]
+    assert len(apps) == 1
+    assert apps[0].status_code == 302
 
 
 def test_execute_missing_library_raises_unavailable(config: Any) -> None:

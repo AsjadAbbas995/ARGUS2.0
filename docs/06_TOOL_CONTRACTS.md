@@ -131,13 +131,17 @@ off on target instability. **Tests:** fixture parse tests using recorded Nmap JS
 
 **Purpose:** HTTP/HTTPS probing and technology fingerprinting. **Input:** resolved
 host:port combinations. **Command construction:** `httpx -json -tech-detect -title
--status-code`. **Arguments:** `-json`, `-tech-detect`, `-title`, `-status-code`, `-follow-redirects`
-(scope-checked). **Scope requirements:** host in-scope; redirect destinations re-checked before
-follow. **Output format:** JSON lines. **Parser:** → `web_apps` + `asset_technologies` rows.
-**Normalized objects:** `web_apps`, `technologies`, `asset_technologies`. **Raw output:**
-`storage/raw/httpx/`. **Errors:** connection failure recorded per host, non-fatal. **Timeouts:**
-per-request, short. **Dependencies:** Nmap / DNS Resolver. **Safety:** redirects scope-checked
-before being followed. **Tests:** fixture parse tests, including redirect-chain fixtures.
+-status-code`. **Arguments:** `-json`, `-tech-detect`, `-title`, `-status-code`.
+**Scope requirements:** host in-scope. Redirect following is disabled: the adapter never
+passes `-follow-redirects`, so HTTPX cannot follow a redirect internally. **Output format:**
+JSON lines. **Parser:** → `web_apps` + `asset_technologies` rows. **Normalized objects:**
+`web_apps`, `technologies`, `asset_technologies`. **Raw output:** `storage/raw/httpx/`.
+**Errors:** connection failure recorded per host, non-fatal. **Timeouts:** per-request,
+short. **Dependencies:** Nmap / DNS Resolver. **Safety:** 3xx responses may be recorded as
+observations, but the adapter does not contact redirect destinations and does not implement
+a redirect-chain workflow. `ScopeGuard` redirect validation remains a policy capability for
+a future controlled workflow, not an implemented HTTPX behavior. **Tests:** fixture parse
+tests, 3xx observations, and no-follow command construction.
 
 ### Katana
 
