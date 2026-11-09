@@ -417,7 +417,7 @@ def _configuration_snapshot(
 
     The snapshot must describe the configuration the run will *actually* execute
     with, so it is derived from the served policy and the request is applied as an
-    overlay on top of it. Two rules follow from what is enforced at runtime:
+    overlay on top of it. Three rules follow from what is enforced at runtime:
 
     * Sections the request mentions (``web``, ``network``, ...) override the
       served policy for that run, so an operator can tune a run without
@@ -432,6 +432,9 @@ def _configuration_snapshot(
       process-level component built once at start-up. Recording a per-run limit that
       nothing enforces would make the persisted row describe a throttle that is not
       in force -- the snapshot would look right while execution ignored it.
+    * ``web.historical_urls`` also comes from the served policy: the GAU adapter is
+      registered once at start-up, so a per-run override can only make the snapshot
+      disagree with the capability the process actually has.
 
     The payload is validated by ``core.config.run_snapshot_from_dict`` and carries no
     ``database`` section, so a DSN (and any password inside it) can never be persisted
@@ -444,6 +447,8 @@ def _configuration_snapshot(
     served = getattr(app.state, "argus_config", None)
     if raw is not None and not isinstance(raw, dict):
         raise ConfigError("configuration must be a mapping")
+    if raw is not None and "web" in raw and not isinstance(raw["web"], dict):
+        raise ConfigError("web must be a mapping")
     if served is None:
         merged: dict = run_snapshot_from_dict(raw)
         if effective_scope is not None:
@@ -456,6 +461,13 @@ def _configuration_snapshot(
             continue  # enforced process-wide; see the docstring
         if section == "scope":
             continue  # replaced below from the program's scope_rules
+        if section == "web" and isinstance(value, dict):
+            # Historical recon is registered process-wide at start-up.
+            value = {
+                key: item
+                for key, item in value.items()
+                if key != "historical_urls"
+            }
         if isinstance(value, dict) and isinstance(merged.get(section), dict):
             merged[section] = {**merged[section], **value}
         else:

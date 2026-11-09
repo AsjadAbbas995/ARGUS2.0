@@ -16,6 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api.server import create_app
+from core.config import Config
 from database.models.entities import Run
 
 #: An explicit test key, passed by the caller. Production has no default credential
@@ -62,6 +63,7 @@ class _RecordingOrchestrator:
     def create_run(self, run: Run) -> _FakeRun:
         stored = _FakeRun(target=run.target, program_id=str(run.program_id))
         stored.status = run.status
+        stored.configuration_snapshot = dict(run.configuration_snapshot or {})
         self.runs[str(stored.id)] = stored
         self.created.append(str(stored.id))
         return stored
@@ -107,6 +109,48 @@ def _seed(orchestrated):
     return run
 
 
+_NO_WEB_OVERLAY = object()
+
+
+def _post_run_with_served_web(
+    *, historical_urls: bool, request_web: object = _NO_WEB_OVERLAY
+):
+    fake = _RecordingOrchestrator()
+    app = create_app(orchestrator=fake, api_key=_API_KEY)
+    app.state.argus_config = Config.from_dict(
+        {
+            "database": {"url": "postgresql://argus:argus@localhost:5432/argus"},
+            "web": {"historical_urls": historical_urls},
+        }
+    )
+    configuration = {} if request_web is _NO_WEB_OVERLAY else {"web": request_web}
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/runs",
+            json={"target": "example.com", "configuration": configuration},
+            headers=_AUTH,
+        )
+        snapshot = None
+        if created.status_code == 201:
+            readback = client.get(
+                f"/api/v1/runs/{created.json()['id']}/configuration", headers=_AUTH
+            )
+            assert readback.status_code == 200, readback.text
+            snapshot = readback.json()["configuration_snapshot"]
+    return created, snapshot, fake
+
+
+def _snapshot_for_served_web(
+    *, historical_urls: bool, request_web: object = _NO_WEB_OVERLAY
+) -> dict:
+    created, snapshot, _ = _post_run_with_served_web(
+        historical_urls=historical_urls, request_web=request_web
+    )
+    assert created.status_code == 201, created.text
+    assert snapshot is not None
+    return snapshot
+
+
 def test_liveness_open_unauthenticated(client: TestClient) -> None:
     with client as c:
         assert c.get("/_healthz").status_code == 200
@@ -132,6 +176,46 @@ def test_create_run_contract(orchestrated) -> None:
         body = r.json()
         assert body["status"] == "CREATED"
         assert body["target"] == "example.com"
+
+
+def test_per_run_web_cannot_enable_historical_urls_when_served_disabled() -> None:
+    snapshot = _snapshot_for_served_web(
+        historical_urls=False,
+        request_web={"historical_urls": True, "crawling": False},
+    )
+    assert snapshot["web"]["historical_urls"] is False
+    assert snapshot["web"]["crawling"] is False
+
+
+def test_per_run_web_cannot_disable_historical_urls_when_served_enabled() -> None:
+    snapshot = _snapshot_for_served_web(
+        historical_urls=True,
+        request_web={"historical_urls": False, "http_probe": False},
+    )
+    assert snapshot["web"]["historical_urls"] is True
+    assert snapshot["web"]["http_probe"] is False
+
+
+@pytest.mark.parametrize("historical_urls", [False, True])
+def test_served_historical_urls_snapshot_without_override(
+    historical_urls: bool,
+) -> None:
+    snapshot = _snapshot_for_served_web(historical_urls=historical_urls)
+    assert snapshot["web"]["historical_urls"] is historical_urls
+
+
+@pytest.mark.parametrize("request_web", [None, False, 0, "enabled", []])
+def test_non_mapping_web_overlay_is_rejected_without_creating_a_run(
+    request_web,
+) -> None:
+    created, snapshot, fake = _post_run_with_served_web(
+        historical_urls=True, request_web=request_web
+    )
+    assert created.status_code == 422
+    assert "web must be a mapping" in created.json()["detail"]
+    assert snapshot is None
+    assert fake.runs == {}
+    assert fake.created == []
 
 
 def test_create_run_rejects_empty_target(orchestrated) -> None:
