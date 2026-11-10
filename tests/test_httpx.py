@@ -40,9 +40,23 @@ from recon.web.httpx_probe import (
 
 FIXTURES = Path(__file__).parent / "fixtures" / "httpx"
 
+EXPECTED_COMMAND_PREFIX = [
+    "httpx",
+    "-json",
+    "-tech-detect",
+    "-title",
+    "-status-code",
+]
+FORBIDDEN_REDIRECT_FLAGS = ("-follow-redirects", "-fr")
+
 
 def _read(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
+
+
+def _assert_fixed_probe_command(command: list[str], target: str) -> None:
+    assert command == [*EXPECTED_COMMAND_PREFIX, target]
+    assert not any(flag in command for flag in FORBIDDEN_REDIRECT_FLAGS)
 
 
 def _result(stdout: str, exit_code: int = 0) -> CommandResult:
@@ -193,6 +207,7 @@ def test_build_command_marker(
     assert command[0] == "httpx"
     assert command[1] == "-json"
     assert command[-1] == "app.example.com"  # normalized target, never a shell string
+    _assert_fixed_probe_command(command, "app.example.com")
 
 
 def test_real_config_never_enables_redirect_following(
@@ -201,6 +216,7 @@ def test_real_config_never_enables_redirect_following(
     config = Config.from_dict({"database": {"url": "sqlite://"}})
     command = adapter.build_command(_Task("app.example.com"), config)
     assert "-follow-redirects" not in command
+    _assert_fixed_probe_command(command, "app.example.com")
 
 
 def test_web_follow_redirects_cannot_enable_following(
@@ -214,6 +230,7 @@ def test_web_follow_redirects_cannot_enable_following(
     )
     command = adapter.build_command(_Task("app.example.com"), config)
     assert "-follow-redirects" not in command
+    _assert_fixed_probe_command(command, "app.example.com")
 
 
 def test_recon_web_follow_redirects_cannot_enable_following(
@@ -227,6 +244,7 @@ def test_recon_web_follow_redirects_cannot_enable_following(
     )
     command = adapter.build_command(_Task("app.example.com"), config)
     assert "-follow-redirects" not in command
+    _assert_fixed_probe_command(command, "app.example.com")
 
 
 def test_duck_typed_config_cannot_inject_follow_redirects(
@@ -243,6 +261,7 @@ def test_duck_typed_config_cannot_inject_follow_redirects(
 
     command = adapter.build_command(_Task("app.example.com"), _DuckConfig())
     assert "-follow-redirects" not in command
+    _assert_fixed_probe_command(command, "app.example.com")
 
 
 # -- execution through the controlled runner ----------------------------------
@@ -308,6 +327,8 @@ def test_redirect_destination_does_not_trigger_second_request(
     apps = [o for o in execution.artifacts if isinstance(o, WebAppObservation)]
     assert len(apps) == 1
     assert apps[0].status_code == 302
+    assert apps[0].url == "http://app.example.com"
+    assert "outside.example.org" not in apps[0].url
 
 
 def test_execute_missing_library_raises_unavailable(config: Any) -> None:
