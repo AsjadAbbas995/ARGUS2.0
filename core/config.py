@@ -65,6 +65,50 @@ def _validate_rule_value(value: Any, rule_type: RuleType, path: str) -> None:
     return None
 
 
+def _normalize_ip_or_cidr_candidate(value: str) -> str:
+    """Strip whitespace and one trailing root dot before IP/CIDR parsing."""
+    candidate = value.strip()
+    if candidate.endswith("."):
+        candidate = candidate[:-1]
+    return candidate
+
+
+def _looks_like_ip_or_cidr(value: str) -> bool:
+    """Return whether ``value`` is shaped like an IP address or CIDR.
+
+    Slash- or colon-bearing values are always treated as IP/CIDR-shaped. Dotted
+    values with four or more all-numeric (or empty) labels are treated as
+    IPv4-shaped so malformed forms such as ``203.0.113.1..2`` cannot slip through
+    as hostnames.
+
+    Numeric dotted hostnames with four or more labels -- for example
+    ``123.456.789.012`` -- are deliberately rejected fail-closed: they are
+    indistinguishable from malformed IPv4 addresses. Values with three or fewer
+    labels remain hostname exclusions.
+    """
+    candidate = _normalize_ip_or_cidr_candidate(value)
+    if not candidate:
+        return False
+    if "/" in candidate or ":" in candidate:
+        return True
+    labels = candidate.split(".")
+    return len(labels) >= 4 and all(
+        label == "" or label.isdigit() for label in labels
+    )
+
+
+def _validate_exclusion_value(value: Any, path: str) -> None:
+    _validate_rule_value(value, RuleType.EXCLUSION, path)
+    if _looks_like_ip_or_cidr(value):
+        candidate = _normalize_ip_or_cidr_candidate(value)
+        try:
+            ipaddress.ip_network(candidate, strict=False)
+        except ValueError as exc:
+            raise ConfigError(
+                f"config.{path} is not a valid IP/CIDR: {value!r}"
+            ) from exc
+
+
 @dataclass(frozen=True)
 class ProjectConfig:
     name: str = "ARGUS"
@@ -102,22 +146,21 @@ class ScopeConfig:
     allowed_ips: tuple[str, ...] = ()
     excluded: tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        for entry in self.allowed_domains:
+            _validate_rule_value(entry, RuleType.DOMAIN, "scope.allowed_domains")
+        for entry in self.allowed_ips:
+            _validate_rule_value(entry, RuleType.CIDR, "scope.allowed_ips")
+        for entry in self.excluded:
+            _validate_exclusion_value(entry, "scope.excluded")
+
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ScopeConfig":
         data = data or {}
-        allowed_domains = tuple(data.get("allowed_domains") or ())
-        allowed_ips = tuple(data.get("allowed_ips") or ())
-        excluded = tuple(data.get("excluded") or ())
-        for entry in allowed_domains:
-            _validate_rule_value(entry, RuleType.DOMAIN, "scope.allowed_domains")
-        for entry in allowed_ips:
-            _validate_rule_value(entry, RuleType.CIDR, "scope.allowed_ips")
-        for entry in excluded:
-            _validate_rule_value(entry, RuleType.EXCLUSION, "scope.excluded")
         return cls(
-            allowed_domains=allowed_domains,
-            allowed_ips=allowed_ips,
-            excluded=excluded,
+            allowed_domains=tuple(data.get("allowed_domains") or ()),
+            allowed_ips=tuple(data.get("allowed_ips") or ()),
+            excluded=tuple(data.get("excluded") or ()),
         )
 
 

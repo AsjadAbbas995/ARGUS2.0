@@ -13,7 +13,12 @@ from dataclasses import dataclass
 from typing import Optional, Sequence, Union
 from urllib.parse import urlparse
 
-from core.config import ScopeConfig
+from core.config import (
+    ConfigError,
+    ScopeConfig,
+    _looks_like_ip_or_cidr,
+    _normalize_ip_or_cidr_candidate,
+)
 
 
 class ScopeRuleType:
@@ -32,6 +37,52 @@ class ScopeRule:
     rule_type: str
     value: str
     allowed: bool = True
+
+    def __post_init__(self) -> None:
+        if self.rule_type == ScopeRuleType.EXCLUSION:
+            if not isinstance(self.value, str) or not _looks_like_ip_or_cidr(
+                self.value
+            ):
+                return
+            candidate = _normalize_ip_or_cidr_candidate(self.value)
+            try:
+                network = ipaddress.ip_network(candidate, strict=False)
+            except ValueError as exc:
+                raise ConfigError(
+                    "scope rule exclusion value is not a valid IP/CIDR: "
+                    f"{self.value!r}"
+                ) from exc
+            single = network.num_addresses == 1
+            object.__setattr__(
+                self,
+                "rule_type",
+                ScopeRuleType.IP if single else ScopeRuleType.CIDR,
+            )
+            object.__setattr__(
+                self,
+                "value",
+                str(network.network_address if single else network),
+            )
+            object.__setattr__(self, "allowed", False)
+            return
+        if self.rule_type not in (ScopeRuleType.IP, ScopeRuleType.CIDR):
+            return
+        if not isinstance(self.value, str) or not self.value:
+            raise ConfigError(
+                f"scope rule {self.rule_type} value must be a non-empty string"
+            )
+        try:
+            if self.rule_type == ScopeRuleType.IP:
+                canonical = str(ipaddress.ip_address(self.value))
+            else:
+                ipaddress.ip_network(self.value, strict=False)
+                return
+        except ValueError as exc:
+            raise ConfigError(
+                f"scope rule {self.rule_type} value is not a valid IP/CIDR: "
+                f"{self.value!r}"
+            ) from exc
+        object.__setattr__(self, "value", canonical)
 
     @classmethod
     def from_row(cls, row: Union["ScopeRule", dict, object]) -> "ScopeRule":
@@ -90,7 +141,11 @@ class ScopeGuard:
         rules: list[ScopeRule] = []
         for domain in scope.allowed_domains:
             rules.append(
-                ScopeRule(rule_type=ScopeRuleType.DOMAIN, value=domain, allowed=True)
+                ScopeRule(
+                    rule_type=ScopeRuleType.DOMAIN,
+                    value=normalize_host(domain),
+                    allowed=True,
+                )
             )
         for entry in scope.allowed_ips:
             network = ipaddress.ip_network(entry, strict=False)
@@ -108,18 +163,7 @@ class ScopeGuard:
                     allowed=True,
                 )
             )
-        for excluded in scope.excluded:
-            if _looks_like_ip(excluded):
-                rule_type = (
-                    ScopeRuleType.IP
-                    if _is_single_ip(excluded)
-                    else ScopeRuleType.CIDR
-                )
-            else:
-                rule_type = ScopeRuleType.EXCLUSION
-            rules.append(
-                ScopeRule(rule_type=rule_type, value=excluded, allowed=False)
-            )
+        rules.extend(_excluded_rule(entry) for entry in scope.excluded)
         return cls(rules)
 
     # -- public API --------------------------------------------------------
@@ -213,6 +257,15 @@ class ScopeGuard:
         )
 
     def check_port(self, port: int) -> ScopeDecision:
+        for rule in self._exclusions:
+            if rule.rule_type == ScopeRuleType.PORT and _port_in_rule(
+                port, rule.value
+            ):
+                return ScopeDecision(
+                    in_scope=False,
+                    reason=f"port {port} excluded by rule {rule.value!r}",
+                    matched_rule=rule.value,
+                )
         allowed = [r for r in self._allows if r.rule_type == ScopeRuleType.PORT]
         for rule in allowed:
             if _port_in_rule(port, rule.value):
@@ -295,12 +348,33 @@ def _looks_like_ip(value: str) -> bool:
         return False
 
 
-def _is_single_ip(value: str) -> bool:
+def _excluded_rule(value: str) -> ScopeRule:
+    """Classify one exclusion, failing closed for malformed IP/CIDR-like values.
+
+    Hostnames keep generic ``EXCLUSION`` semantics and are normalized. Values
+    shaped like an IP address or CIDR must parse; otherwise a ``ConfigError`` is
+    raised rather than silently degrading into an exclusion that ``check_ip``
+    would ignore.
+    """
+    if not _looks_like_ip_or_cidr(value):
+        return ScopeRule(
+            rule_type=ScopeRuleType.EXCLUSION,
+            value=normalize_host(value),
+            allowed=False,
+        )
+    candidate = _normalize_ip_or_cidr_candidate(value)
     try:
-        ip = ipaddress.ip_address(value)
-        return isinstance(ip, (ipaddress.IPv4Address, ipaddress.IPv6Address))
-    except ValueError:
-        return False
+        network = ipaddress.ip_network(candidate, strict=False)
+    except ValueError as exc:
+        raise ConfigError(
+            f"config.scope.excluded is not a valid IP/CIDR: {value!r}"
+        ) from exc
+    single = network.num_addresses == 1
+    return ScopeRule(
+        rule_type=ScopeRuleType.IP if single else ScopeRuleType.CIDR,
+        value=str(network.network_address if single else network),
+        allowed=False,
+    )
 
 
 def _is_valid_hostname(host: str) -> bool:
@@ -334,11 +408,8 @@ def _host_matches(host: str, rule_value: str) -> bool:
 
 
 def _ip_in_network(ip, network_value: str) -> bool:
-    try:
-        network = ipaddress.ip_network(network_value, strict=False)
-        return ip in network
-    except ValueError:
-        return False
+    network = ipaddress.ip_network(network_value, strict=False)
+    return ip in network
 
 
 def _port_in_rule(port: int, rule_value: str) -> bool:

@@ -11,6 +11,7 @@ from core.config import (
     ConfigError,
     JavascriptConfig,
     LimitsConfig,
+    ScopeConfig,
     TcpPortRange,
     WebConfig,
     run_snapshot_from_dict,
@@ -122,6 +123,79 @@ scope:
 """
     with pytest.raises(ConfigError, match="allowed_ips"):
         Config.load(write_config(tmp_path, text))
+
+
+def test_malformed_ipv4_exclusion_prefix_rejected() -> None:
+    with pytest.raises(ConfigError, match="scope.excluded"):
+        ScopeConfig.from_dict({"excluded": ["203.0.113.128/33"]})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "203.0.113.1..2",
+        "203.0.113.1.2",
+        "203..0.113.1",
+        "203.0.113.999..",
+    ],
+)
+def test_malformed_ipv4_like_exclusion_rejected(value: str) -> None:
+    with pytest.raises(ConfigError, match="scope.excluded"):
+        ScopeConfig.from_dict({"excluded": [value]})
+
+
+@pytest.mark.parametrize("value", ["123.456.789.012", "999.999.999.999"])
+def test_numeric_dotted_hostname_exclusion_fails_closed(value: str) -> None:
+    with pytest.raises(ConfigError, match="scope.excluded"):
+        ScopeConfig.from_dict({"excluded": [value]})
+
+
+def test_three_label_numeric_hostname_exclusion_remains_a_hostname() -> None:
+    assert ScopeConfig.from_dict({"excluded": ["123.456.789"]}).excluded == (
+        "123.456.789",
+    )
+
+
+def test_malformed_ipv4_exclusion_syntax_rejected() -> None:
+    with pytest.raises(ConfigError, match="scope.excluded"):
+        ScopeConfig.from_dict({"excluded": ["203.0.113.0/not-a-prefix"]})
+
+
+def test_malformed_ipv6_exclusion_prefix_rejected() -> None:
+    with pytest.raises(ConfigError, match="scope.excluded"):
+        ScopeConfig.from_dict({"excluded": ["2001:db8::/129"]})
+
+
+def test_malformed_ipv6_exclusion_syntax_rejected() -> None:
+    with pytest.raises(ConfigError, match="scope.excluded"):
+        ScopeConfig.from_dict({"excluded": ["2001:db8:::1/64"]})
+
+
+def test_direct_scope_config_rejects_malformed_exclusion() -> None:
+    with pytest.raises(ConfigError, match="scope.excluded"):
+        ScopeConfig(
+            allowed_ips=("203.0.113.0/24",),
+            excluded=("203.0.113.128/33",),
+        )
+
+
+def test_direct_scope_config_rejects_malformed_ipv4_like_exclusion() -> None:
+    with pytest.raises(ConfigError, match="scope.excluded"):
+        ScopeConfig(
+            allowed_ips=("203.0.113.0/24",),
+            excluded=("203.0.113.1..2",),
+        )
+
+
+def test_valid_ip_and_hostname_exclusions_accepted() -> None:
+    excluded = (
+        "203.0.113.7",
+        "203.0.113.0/24",
+        "2001:db8::1",
+        "2001:db8::/32",
+        "Admin.Example.Com.",
+    )
+    assert ScopeConfig.from_dict({"excluded": excluded}).excluded == excluded
 
 
 def test_invalid_ai_mode_rejected(tmp_path: Path) -> None:
