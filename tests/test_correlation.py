@@ -238,7 +238,9 @@ def test_dedupe_functions_are_stable_under_repeated_re_analysis() -> None:
     assert len(nodes) == 1
     edge = Edge(source="a", target="b", kind="links", evidence_id="ev")
     edges = dedupe_edges([edge, edge])
-    assert len(edges) == 1
+    # Stage 2A.1 correction: legacy unresolved edges are preserved (no display-key
+    # dedupe) because collapsing them before ambiguity detection can lose information.
+    assert len(edges) == 2
     inference = Inference(
         kind=OBJECT_API,
         statement="s",
